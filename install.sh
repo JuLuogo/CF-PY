@@ -24,6 +24,11 @@ ok()   { printf '%s\n' "${GRN} ✓${RST} $*"; }
 warn() { printf '%s\n' "${YEL} !${RST} $*"; }
 die()  { printf '%s\n' "${RED} ✗${RST} $*" >&2; exit 1; }
 
+# 很多 VPS 没配 locale（LANG 为空），Python 的 stdout 会退化成 latin-1，
+# 脚本里内嵌的 Python 一 print 中文就 UnicodeEncodeError。
+export PYTHONIOENCODING=utf-8
+export PYTHONUTF8=1
+
 # 脚本是 curl | bash 执行的，stdin 是管道，交互必须走 /dev/tty。
 #
 # 但不能只看 /dev/tty 能不能打开 —— 在 CI、重定向、被别的脚本调用等
@@ -37,6 +42,14 @@ else
   TTY=""
 fi
 
+# 清掉输入里的控制字符。
+# 关键：不少终端（PuTTY 默认、部分 SSH 客户端）退格键发的是 ^H (ASCII 8)
+# 而不是 DEL (127)，tty 的 erase 字符是 DEL，于是退格不被识别、
+# 直接被当成普通字符存进变量 —— 实测导致 -threads 变成 "60\x08\x08\x08\x08"。
+_sanitize() {
+  printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037\177'
+}
+
 ask() {  # ask <提示> <默认值>
   local prompt="$1" def="$2" ans=""
   if [ -n "$TTY" ]; then
@@ -44,7 +57,22 @@ ask() {  # ask <提示> <默认值>
     # 再兜一层超时：万一终端断了，也不至于卡死
     IFS= read -r -t "${CFIP_ASK_TIMEOUT:-120}" ans < "$TTY" || ans=""
   fi
+  ans=$(_sanitize "$ans")
   printf '%s' "${ans:-$def}"
+}
+
+# 只接受纯数字，非法就退回默认值（防止退格符之类的脏数据进 unit 文件）
+ask_num() {  # ask_num <提示> <默认值> <最小> <最大>
+  local prompt="$1" def="$2" lo="$3" hi="$4" v
+  v=$(ask "$prompt" "$def")
+  case "$v" in
+    ''|*[!0-9]*)
+      warn "「$v」不是纯数字，用默认值 $def"
+      v="$def" ;;
+  esac
+  if [ "$v" -lt "$lo" ] 2>/dev/null; then v="$lo"; fi
+  if [ "$v" -gt "$hi" ] 2>/dev/null; then v="$hi"; fi
+  printf '%s' "$v"
 }
 
 ask_secret() {
@@ -53,6 +81,7 @@ ask_secret() {
     printf '%s' "$prompt" > "$TTY" 2>/dev/null || true
     IFS= read -r -t "${CFIP_ASK_TIMEOUT:-120}" ans < "$TTY" || ans=""
   fi
+  ans=$(_sanitize "$ans")
   printf '%s' "${ans:-$def}"
 }
 
@@ -168,15 +197,19 @@ esac
 ok "ASN 档位：${ASNS}"
 
 # 3) 采样与循环
-SAMPLE=$(ask "  每轮采样多少个网段？(0=全量) [300]: " "300")
-LOOP=$(ask   "  每轮间隔多少秒？[1800]: " "1800")
-THREADS=$(ask "  并发线程数？(VPS 建议 50~200) [50]: " "50")
+SAMPLE=$(ask_num "  每轮采样多少个网段？(0=全量) [300]: " "300" 0 2000000)
+LOOP=$(ask_num   "  每轮间隔多少秒？[1800]: " "1800" 60 604800)
+THREADS=$(ask_num "  并发线程数？(VPS 建议 50~200) [50]: " "50" 1 500)
+if [ "$SAMPLE" = "0" ]; then
+  warn "全量模式：vps 档位会展开约 18 万个网段，一轮要跑一两个小时、"
+  warn "内存占用可能到 500MB 以上。内存小的机器建议用采样模式（比如 3000）。"
+fi
 
 # 4) Web 面板
 WEB_ENABLE="n"; WEB_PORT="$WEB_PORT_DEFAULT"; WEB_TOKEN=""
 if confirm "  要不要开 Web 管理面板（浏览器看状态和结果）？" "y"; then
   WEB_ENABLE="y"
-  WEB_PORT=$(ask "  面板端口 [${WEB_PORT_DEFAULT}]: " "$WEB_PORT_DEFAULT")
+  WEB_PORT=$(ask_num "  面板端口 [${WEB_PORT_DEFAULT}]: " "$WEB_PORT_DEFAULT" 1 65535)
   AUTO_TOKEN=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
   WEB_TOKEN=$(ask "  访问口令（直接回车用随机生成的）: " "$AUTO_TOKEN")
   BIND=$(ask "  只允许本机访问(1) 还是对外开放(2)？[1]: " "1")

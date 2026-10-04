@@ -732,6 +732,30 @@ def load_ips(path):
     return out
 
 
+# 每批提交多少个任务。一次性把 18 万个 Future 丢进线程池会吃掉上百 MB
+# （每个 Future + 字典条目约 500 字节），小内存 VPS 上会把同机的其它服务
+# 挤到 OOM。分批提交后峰值内存只跟批大小有关，跟总任务数无关。
+TASK_BATCH = 2000
+
+
+def submit_batched(ex, fn, items, batch=TASK_BATCH):
+    """分批提交任务，边完成边产出 (item, result_or_exception)。
+
+    用法跟 as_completed 一样，但内存占用有上界。
+    """
+    total = len(items)
+    for start in range(0, total, batch):
+        chunk = items[start:start + batch]
+        fmap = {ex.submit(fn, x): x for x in chunk}
+        for fut in as_completed(fmap):
+            x = fmap[fut]
+            try:
+                yield x, fut.result(), None
+            except Exception as e:               # noqa: BLE001
+                yield x, None, e
+        del fmap
+
+
 # ==================== Stage 1 ====================
 def availability(ip, timeout=CURL_TIMEOUT_SEC, port="443"):
     """可用性检查。端口默认 443，也支持 CF 的其它 HTTPS 端口（2053/2083/2087/2096/8443）。
@@ -769,20 +793,19 @@ def stage1(items, threads):
     done = 0
     out = []
     log(f"\n[*] 第一阶段：可用性，{total} IP，{threads}线程")
+
+    def _check(x):
+        return availability(x["ip"], CURL_TIMEOUT_SEC, str(x.get("port") or "443"))
+
     with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="avail") as ex:
-        fmap = {ex.submit(availability, x["ip"], CURL_TIMEOUT_SEC,
-                          str(x.get("port") or "443")): x for x in items}
-        for fut in as_completed(fmap):
-            x = fmap[fut]
+        for x, cf, err in submit_batched(ex, _check, items):
             done += 1
             ip = x["ip"]
             port = str(x.get("port") or "443")
             tag = ip if port == "443" else f"{ip}:{port}"
-            try:
-                cf = fut.result()
-            except Exception as e:
-                cf = None
-                progress("availability", done, total, f"{tag} | DROP exception={e}")
+            if err is not None:
+                progress("availability", done, total, f"{tag} | DROP exception={err}")
+                continue
             if not cf:
                 progress("availability", done, total, f"{tag} | DROP: Cloudflare trace不可用")
                 continue
@@ -923,17 +946,18 @@ def stage2(items, threads, speed_bytes):
     speed_workers = max(1, min(DEFAULT_SPEED_WORKERS, threads, total))
     log(f"\n[*] 第二阶段：延迟+速度，{total} IP，任务线程 {threads}，下载并发 {speed_workers}")
     sem = threading.Semaphore(speed_workers)
+
+    def _check(x):
+        return speed_worker(x, speed_bytes, sem)
+
     with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="speed") as ex:
-        fmap = {ex.submit(speed_worker, x, speed_bytes, sem): x for x in items}
-        for fut in as_completed(fmap):
-            x = fmap[fut]
+        for x, res_t, err in submit_batched(ex, _check, items):
             done += 1
             ip = x["ip"]
-            try:
-                _, res, reason = fut.result()
-            except Exception as e:
-                res = None
-                reason = f"DROP: exception={e}"
+            if err is not None:
+                res, reason = None, f"DROP: exception={err}"
+            else:
+                _, res, reason = res_t
             if res:
                 out.append(res)
                 progress("speed/latency", done, total,
@@ -1152,19 +1176,19 @@ def stage3(items, threads, skiptr):
     done = 0
     out = []
     log(f"\n[*] 第三阶段：{'跳过traceroute' if skiptr else 'traceroute线路分析'}，{total} IP，{threads}线程")
+
+    def _trace(x):
+        return trace_worker(x, threads, skiptr)
+
     with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="trace") as ex:
-        fmap = {ex.submit(trace_worker, x, threads, skiptr): x for x in items}
-        for fut in as_completed(fmap):
-            x = fmap[fut]
+        for x, r, err in submit_batched(ex, _trace, items):
             done += 1
             ip = x["ip"]
-            try:
-                r = fut.result()
-            except Exception as e:
+            if err is not None:
                 r = dict(x)
                 r.update(route="Skipped" if skiptr else "Unknown",
                          tour="None", route_confidence="unknown")
-                log(f"[traceroute {done}/{total}] {ip} | ERROR {e}")
+                log(f"[traceroute {done}/{total}] {ip} | ERROR {err}")
             out.append(r)
             progress("traceroute", done, total,
                      f"{ip} | route={r.get('route')} tour={r.get('tour')} "

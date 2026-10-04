@@ -8,13 +8,23 @@
 #
 #  它会从「服务是否在跑」一路查到「公网能不能连上」，逐项告诉你卡在哪。
 # ============================================================================
-PORT="${1:-8080}"
+PORT="${1:-}"
 UNIT="/etc/systemd/system/cfip-web.service"
 OK=$'\033[32m ✓\033[0m'; NO=$'\033[31m ✗\033[0m'; WARN=$'\033[33m !\033[0m'
 BLD=$'\033[1m'; RST=$'\033[0m'
 
+# 没给端口就从 unit 文件里读 —— 装的时候经常用的是非标端口，
+# 手动传错端口会导致诊断结果全是误导。
+if [ -z "$PORT" ] && [ -f "$UNIT" ]; then
+  PORT=$(grep -oP '(?<=-port )\d+' "$UNIT" 2>/dev/null | head -1)
+fi
+PORT="${PORT:-8080}"
+
 echo "${BLD}============================================================${RST}"
 echo "${BLD}  Web 面板外网访问诊断 · 端口 ${PORT}${RST}"
+if [ -f "$UNIT" ] && [ -z "${1:-}" ]; then
+  echo "  （端口是从 $UNIT 自动读出来的，也可手动指定：bash check.sh 9000）"
+fi
 echo "${BLD}============================================================${RST}"
 echo
 
@@ -27,8 +37,17 @@ else
   echo "  单元文件：$UNIT"
   ACTIVE=$(systemctl is-active cfip-web.service 2>&1)
   ENABLED=$(systemctl is-enabled cfip-web.service 2>&1)
-  [ "$ACTIVE" = "active" ] && echo "${OK} 运行中（enabled=$ENABLED）" \
-                           || echo "${NO} 没在跑（active=$ACTIVE）—— systemctl start cfip-web"
+  if [ "$ACTIVE" = "active" ]; then
+    echo "${OK} 运行中（enabled=$ENABLED）"
+  else
+    echo "${NO} 没在跑（active=$ACTIVE）—— 这就是外网打不开的直接原因"
+    echo
+    echo "  ${BLD}服务日志（最后 25 行，失败原因通常就在这里）${RST}"
+    journalctl -u cfip-web -n 25 --no-pager 2>/dev/null | sed 's/^/    /'
+    echo
+    echo "    试着启动： systemctl start cfip-web"
+    echo "    再看日志： journalctl -u cfip-web -n 50 --no-pager"
+  fi
   echo "  ExecStart："
   grep -E '^ExecStart' "$UNIT" | sed 's/^/    /'
 
