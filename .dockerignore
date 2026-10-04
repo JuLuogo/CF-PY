@@ -1,0 +1,22 @@
+# 构建上下文里不需要的东西 —— 让镜像更小、也避免把本地结果打进去
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+
+# 运行产物
+output/
+ip.txt
+ip.csv
+route_cache.json
+fofa_queries.txt
+*.log
+
+# Windows 专用
+run.bat
+menu.py
+
+# 文档
+*.md
+LICENSE

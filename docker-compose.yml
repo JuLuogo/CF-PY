@@ -1,0 +1,91 @@
+# Cloudflare 反代 IP 优选 —— 一键部署
+#
+#   docker compose up -d          启动（后台 24 小时跑）
+#   docker compose logs -f        看实时日志
+#   docker compose down           停止
+#
+# 产物落在宿主机 ./output/ 下（含 ip.txt 和 bestips-*.csv）。
+
+services:
+  cfip:
+    # 推到 GitHub 后 GitHub Actions 会自动构建并推送到 GHCR
+    image: ghcr.io/juluogo/cf-py:latest
+    # 想本地构建就打开这行（会忽略上面的 image）
+    # build: .
+
+    container_name: cfip
+    restart: unless-stopped
+
+    # ⚠⚠ 必须是 host 网络，这不是可选项。
+    # bridge 模式下容器的流量要走 Docker NAT，ping/traceroute 的第一跳会变成
+    # 172.17.0.1，阶段三的线路分析（163/CN2/CMI/169）会完全失真；
+    # 而且 24 小时扫描要的是这台 VPS 的真实出口质量，不是容器网桥的。
+    # 注意：host 网络只在 Linux 上有效。Docker Desktop（Win/macOS）跑在虚拟机里，
+    # 拿到的永远是虚拟机那条路径，测出来的延迟/线路不能代表宿主机。
+    network_mode: host
+
+    # ping 需要 NET_RAW（Docker 默认就给，显式写出来免得被安全策略收走）
+    cap_add:
+      - NET_RAW
+
+    environment:
+      TZ: Asia/Shanghai
+
+      # —— 扫描哪些厂商 ——
+      # 档位：niche 小众优质线路 / vps 主流便宜 VPS / all 除大陆外全部
+      # 也可写厂商名：alibaba tencent oracle bandwagon dmit akile cloudie ...
+      ASNS: "vps"
+      # 每个 ASN 采样多少个 /24（每个 /24 取一个 IP）。建议 100~300；0 = 全量。
+      ASN_SAMPLE: "300"
+      # 地区过滤：黑名单模式，排除大陆，其余全要
+      ASN_EXCLUDE_REGIONS: "CN"
+
+    volumes:
+      # 所有产物都在这里：output/{日期}/ip.txt 和 bestips-*.csv
+      - ./output:/app/output
+      # 想改配置就打开这行（不改的话用镜像内置的 config.ini）
+      # - ./config.ini:/app/config.ini:ro
+
+    # 默认命令在 Dockerfile 里：
+    #   -source asn -loop 1800 -run -- -threads 20 -d 5 -log -quiet
+    # -quiet 是小硬盘必需：逐条进度日志一轮能写十几 MB。
+    #
+    # 常用改法：
+    #   command: ["-source","asn","-asns","niche","-loop","600",
+    #             "-run","--","-threads","50","-d","5","-log","-quiet"]
+    #   command: ["-source","list","-list-regions","HK,JP,SG","-max","100",
+    #             "-loop","3600","-run","--","-threads","20","-d","5","-log","-quiet"]
+    #   只想跑一次不循环：把 -loop 1800 去掉即可。
+
+    # 日志别无限涨
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Web 控制台（可选）。用 profile 控制，不加 --profile web 就不会启动：
+  #   docker compose --profile web up -d
+  # 注意 token 必须改，否则等于把控制权公开出去。
+  webui:
+    image: ghcr.io/juluogo/cf-py:latest
+    # build: .
+    container_name: cfip-web
+    restart: unless-stopped
+    network_mode: host
+    profiles: ["web"]
+    volumes:
+      - ./output:/app/output
+      # Web 面板要读 ip.txt 和 config.ini，只读挂进来
+      - ./config.ini:/app/config.ini:ro
+    environment:
+      TZ: Asia/Shanghai
+      WEBUI_TOKEN: "change-me-please"
+      WEBUI_RUN_ARGS: "-source asn -max 200 -run -- -threads 20 -d 3 -log -quiet"
+    entrypoint: ["/usr/bin/tini", "--", "python", "webui.py"]
+    command: ["-host", "0.0.0.0", "-port", "8080"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

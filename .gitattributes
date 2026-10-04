@@ -1,0 +1,24 @@
+# 统一换行符。这条对 install.sh 是硬需求：
+# Windows 上 git 默认 autocrlf 会把 LF 转成 CRLF，一旦 install.sh 带着 CRLF
+# 提交上去，用户 `curl | bash` 执行时会报 `\r: command not found`。
+* text=auto
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.ini   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+Dockerfile      text eol=lf
+.dockerignore   text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# Windows 批处理必须是 CRLF，否则某些命令会出错
+*.bat   text eol=crlf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
