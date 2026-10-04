@@ -15,10 +15,13 @@ BLD=$'\033[1m'; RST=$'\033[0m'
 
 # 没给端口就从 unit 文件里读 —— 装的时候经常用的是非标端口，
 # 手动传错端口会导致诊断结果全是误导。
-if [ -z "$PORT" ] && [ -f "$UNIT" ]; then
-  PORT=$(grep -oP '(?<=-port )\d+' "$UNIT" 2>/dev/null | head -1)
+UNIT_PORT=""
+if [ -f "$UNIT" ]; then
+  UNIT_PORT=$(grep -oP '(?<=-port )\d+' "$UNIT" 2>/dev/null | head -1)
 fi
-PORT="${PORT:-8080}"
+if [ -z "$PORT" ]; then
+  PORT="${UNIT_PORT:-8080}"
+fi
 
 echo "${BLD}============================================================${RST}"
 echo "${BLD}  Web 面板外网访问诊断 · 端口 ${PORT}${RST}"
@@ -35,12 +38,24 @@ if [ ! -f "$UNIT" ]; then
   echo "    重装：bash install.sh  然后选「开 Web 面板」"
 else
   echo "  单元文件：$UNIT"
-  ACTIVE=$(systemctl is-active cfip-web.service 2>&1)
-  ENABLED=$(systemctl is-enabled cfip-web.service 2>&1)
-  if [ "$ACTIVE" = "active" ]; then
-    echo "${OK} 运行中（enabled=$ENABLED）"
+  # 注意：不能用 [ "$(systemctl is-active X)" = "active" ] 来判断 ——
+  # systemctl 的输出是【本地化】的，中文系统上会返回「运行中」/「失败」，
+  # 跟英文 "active" 比较永远不相等，会把正在跑的服务误报成挂了。
+  # 正确做法是用 --quiet 看退出码，跟语言无关。
+  if systemctl is-active --quiet cfip-web.service 2>/dev/null; then
+    ACTIVE="active"
   else
-    echo "${NO} 没在跑（active=$ACTIVE）—— 这就是外网打不开的直接原因"
+    ACTIVE="inactive"
+  fi
+  if systemctl is-enabled --quiet cfip-web.service 2>/dev/null; then
+    ENABLED="enabled"
+  else
+    ENABLED="disabled"
+  fi
+  if [ "$ACTIVE" = "active" ]; then
+    echo "${OK} 运行中（开机自启：$ENABLED）"
+  else
+    echo "${NO} 没在跑 —— 这就是外网打不开的直接原因"
     echo
     echo "  ${BLD}服务日志（最后 25 行，失败原因通常就在这里）${RST}"
     journalctl -u cfip-web -n 25 --no-pager 2>/dev/null | sed 's/^/    /'
@@ -130,22 +145,30 @@ fi
 echo
 
 # ---------------------------------------------------------------- 5. 云厂商安全组
-echo "${BLD}[5] 云厂商安全组（最容易漏的一环）${RST}"
+echo "${BLD}[5] 云厂商防火墙 / 安全组（最容易漏的一环）${RST}"
+# 从主机名也能看出厂商 —— 很多便宜 VPS 的 hostname 就是 <随机>.厂商域名
+HOSTN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "")
 VENDOR=""
 [ -f /sys/class/dmi/id/product_name ] && VENDOR=$(cat /sys/class/dmi/id/product_name 2>/dev/null)
-[ -f /sys/class/dmi/id/sys_vendor ] && VENDOR="$VENDOR $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)"
-case "$VENDOR" in
-  *Alibaba*|*Alibaba*Cloud*|*ecs*) echo "  疑似阿里云 ECS" ;;
-  *Tencent*|*CVM*)                 echo "  疑似腾讯云 CVM" ;;
-  *Huawei*|*KVM*)                  echo "  疑似华为云 / KVM" ;;
-  *Amazon*|*AWS*)                  echo "  疑似 AWS EC2" ;;
-  *)                               echo "  识别不出厂商（DMI: ${VENDOR:-未知}）" ;;
+COMBINED="$VENDOR $HOSTN"
+CLOUD=""
+case "$COMBINED" in
+  *bytevirt*)   CLOUD="ByteVirt —— 客户面板 → 防火墙/Firewall → 放行 TCP ${PORT}" ;;
+  *racknerd*)   CLOUD="RackNerd —— SolusVM 面板 → Firewall → 放行 TCP ${PORT}" ;;
+  *vultr*)      CLOUD="Vultr —— 控制台 → Firewall → Add Rule → TCP ${PORT}" ;;
+  *digitalocean*|*droplet*) CLOUD="DigitalOcean —— Networking → Firewalls → Inbound → TCP ${PORT}" ;;
+  *linode*|*akamai*)        CLOUD="Linode —— Cloud Manager → Firewalls → Inbound → TCP ${PORT}" ;;
+  *oracle*|*oci*)           CLOUD="Oracle Cloud —— VCN → Security Lists → Ingress → TCP ${PORT}（还有 iptables！OCI 镜像默认开着 iptables）" ;;
+  *Alibaba*|*ecs*)          CLOUD="阿里云 ECS —— ECS 控制台 → 安全组 → 配置规则 → 入方向 → 添加 TCP ${PORT}/0.0.0.0/0" ;;
+  *Tencent*|*CVM*)          CLOUD="腾讯云 —— 控制台 → 防火墙/安全组 → 添加 TCP ${PORT}" ;;
+  *Huawei*)                 CLOUD="华为云 —— ECS → 安全组 → 入方向规则 → 添加 TCP ${PORT}" ;;
+  *Amazon*|*AWS*|*ec2*)     CLOUD="AWS —— EC2 → Security Groups → Inbound → Custom TCP ${PORT}" ;;
+  *)                        CLOUD="你的云控制台 → 安全组/防火墙 → 入方向放行 TCP ${PORT}" ;;
 esac
-echo "${WARN} 安全组是云控制台里的，操作系统里改不了，必须去网页控制台放行 ${PORT}"
-echo "    阿里云：ECS 控制台 → 安全组 → 配置规则 → 入方向 → 添加 TCP ${PORT}/0.0.0.0/0"
-echo "    腾讯云：轻量/CVM 控制台 → 防火墙 → 添加规则 → TCP ${PORT}"
-echo "    华为云：ECS → 安全组 → 入方向规则"
-echo "    AWS：  EC2 → Security Groups → Inbound → Custom TCP ${PORT}"
+[ -n "$HOSTN" ] && echo "  主机名：$HOSTN"
+[ -n "$VENDOR" ] && echo "  DMI   ：$VENDOR"
+echo "${WARN} ${CLOUD}"
+echo "    ⚠ 这是在云控制台里改的，操作系统里改了没用。"
 echo
 
 # ---------------------------------------------------------------- 6. 公网自测
@@ -153,10 +176,11 @@ echo "${BLD}[6] 从公网侧自测${RST}"
 PUB=$(curl -sS --max-time 8 https://api.ipify.org 2>/dev/null \
       || curl -sS --max-time 8 https://ifconfig.me 2>/dev/null \
       || curl -sS --max-time 8 https://ipinfo.io/ip 2>/dev/null)
+PC="000"
 if [ -n "$PUB" ]; then
   echo "  本机公网 IP：$PUB"
-  C=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "http://${PUB}:${PORT}/healthz" 2>/dev/null)
-  if [ "$C" = "200" ]; then
+  PC=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "http://${PUB}:${PORT}/healthz" 2>/dev/null)
+  if [ "$PC" = "200" ]; then
     echo "${OK} 从公网 IP 能连上 —— 服务侧没问题"
     echo "    如果浏览器还是打不开，检查："
     echo "      1) 面板地址要带 token： http://${PUB}:${PORT}/?token=你的口令"
@@ -187,8 +211,46 @@ if [ -f "$UNIT" ]; then
 fi
 echo
 echo "${BLD}============================================================${RST}"
-echo "  最省事的替代方案：不开公网，用 SSH 端口转发"
+echo "${BLD}  结论${RST}"
+echo "${BLD}============================================================${RST}"
+
+# 汇总各环节，给出唯一该做的那件事
+SVC_OK=0; [ -f "$UNIT" ] && systemctl is-active --quiet cfip-web.service 2>/dev/null && SVC_OK=1
+LISTEN_OK=0; [ -n "$L" ] && echo "$L" | grep -q '0\.0\.0\.0\|\[::\]\|\*:' && LISTEN_OK=1
+LOCAL_OK=0; [ "${C:-000}" = "200" ] && LOCAL_OK=1
+PUB_OK=0; [ "${PC:-000}" = "200" ] && PUB_OK=1
+
+if [ "$SVC_OK" = "0" ]; then
+  echo "  ${NO} 服务没在跑 —— 先解决这个，看上面 [1] 里的日志"
+  echo "      systemctl start cfip-web && journalctl -u cfip-web -n 50 --no-pager"
+elif [ "$LISTEN_OK" = "0" ]; then
+  echo "  ${NO} 服务在跑但没在 0.0.0.0 上监听 —— 改 unit 文件里的 -host"
+elif [ "$LOCAL_OK" = "0" ]; then
+  echo "  ${NO} 本机都连不上 —— 服务本身有问题，看 journalctl -u cfip-web"
+elif [ "$PUB_OK" = "1" ]; then
+  echo "  ${OK} 服务侧全部正常，公网也能连上"
+  echo "      浏览器打不开的话，确认地址带 token："
+  echo "      http://<你的公网IP>:${PORT}/?token=你的口令"
+elif [ "$PORT" != "$UNIT_PORT" ] && [ -n "$UNIT_PORT" ]; then
+  echo "  ${NO} 你在检查端口 ${PORT}，但服务实际监听的是 ${UNIT_PORT} —— 端口传错了"
+  echo "      bash check.sh ${UNIT_PORT}"
+else
+  echo "  ${WARN} 服务在跑、监听正常、本机也能连，但公网连不上"
+  echo "      → 【被挡在中间了】，按可能性排序："
+  echo "        1. 云厂商防火墙/安全组没放行 ${PORT}   ← 八成是这个"
+  echo "        2. 系统防火墙（上面 [4] 已查）"
+  echo "        3. 运营商封了这个端口 → 换个端口，比如 18080 或 30502"
+  echo
+  echo "      验证是不是安全组问题：临时换一个端口试试"
+  echo "        sed -i 's/-port ${PORT}/-port 18080/' $UNIT"
+  echo "        systemctl daemon-reload && systemctl restart cfip-web"
+  echo "        bash check.sh 18080"
+  echo "      如果 18080 通了，说明 ${PORT} 被挡了（安全组或运营商）。"
+fi
+
+echo
+echo "${BLD}  最省事的替代方案：不开公网，用 SSH 端口转发${RST}"
 echo "    在你自己的电脑上： ssh -L ${PORT}:127.0.0.1:${PORT} root@你的VPS"
 echo "    然后浏览器打开：   http://127.0.0.1:${PORT}/?token=你的口令"
-echo "  这样面板永远不暴露在公网，比开安全组安全得多。"
+echo "  面板永远不暴露在公网，不用碰安全组，比开公网安全得多。"
 echo "${BLD}============================================================${RST}"

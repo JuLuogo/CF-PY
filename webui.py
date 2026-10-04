@@ -30,6 +30,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATUS_FILE = os.path.join(HERE, "output", "status.json")
 LOG_DIR = os.path.join(HERE, "output")
 
+# 强制 stdout/stderr 用 UTF-8。
+# 很多 VPS 没配 locale（LANG 为空），Python 会退回 C locale，stdout 变成
+# latin-1，一 print 中文就 UnicodeEncodeError 直接崩。
+# 实测 cfip-web 就是这么挂的（systemd 里无限重启，status=1/FAILURE）。
+# 在代码里兜住比依赖 unit 文件里的环境变量可靠得多。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 

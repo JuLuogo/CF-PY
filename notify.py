@@ -23,9 +23,18 @@
 import json
 import os
 import re
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# 强制 stdout/stderr 用 UTF-8（VPS 常没配 locale，Python 会退回 latin-1，
+# 一 print 中文就 UnicodeEncodeError 崩掉）
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 NOTIFY_CHANNEL = ""
 NOTIFY_TARGET = ""

@@ -51,6 +51,16 @@ from datetime import datetime
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_FILE = os.path.join(HERE, "config.ini")
 
+# 强制 stdout/stderr 用 UTF-8。
+# 很多 VPS 没配 locale（LANG 为空），Python 会退回 C locale，stdout 变成
+# latin-1，一 print 中文就 UnicodeEncodeError 直接崩。
+# 在代码里兜住比依赖 systemd unit 里的环境变量可靠得多。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 # ==================== 默认配置（可被 config.ini / 环境变量 / 命令行覆盖） ====================
 FOFA_API_BASE = "https://fofa.info"
 FOFA_EMAIL = ""

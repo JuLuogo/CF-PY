@@ -130,6 +130,8 @@ command -v python3 >/dev/null 2>&1 || NEED+=(python3)
 command -v curl    >/dev/null 2>&1 || NEED+=(curl)
 command -v ping    >/dev/null 2>&1 || NEED+=(iputils-ping)
 command -v traceroute >/dev/null 2>&1 || NEED+=(traceroute)
+# git 用来 clone 和后续 git pull 更新；装不上就退回 tarball，不影响使用
+command -v git >/dev/null 2>&1 || NEED+=(git)
 [ ${#NEED[@]} -gt 0 ] && install_pkgs "${NEED[@]}" || true
 # Alpine 的 ping/traceroute 包名不同
 command -v ping >/dev/null 2>&1 || install_pkgs iputils 2>/dev/null || true
@@ -310,6 +312,10 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${INSTALL_DIR}/cfip.env
+# 没配 locale 的机器上 Python 会退回 latin-1，打印中文直接崩。
+# 脚本里已经有代码级兜底（sys.stdout.reconfigure），这里再加一层保险。
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUTF8=1
 ExecStart=/usr/bin/env python3 fetch_ips.py -source asn -loop ${LOOP} -run -- -threads ${THREADS} -d 5 -log -quiet
 Restart=always
 RestartSec=30
@@ -335,7 +341,11 @@ After=network-online.target
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/env python3 webui.py -host ${WEB_HOST} -port ${WEB_PORT} -token ${WEB_TOKEN} -run-args "-source asn -max 200 -run -- -threads ${THREADS} -d 3 -log"
+# 没配 locale 的机器上 Python 会退回 latin-1，打印中文直接崩（实测踩过）。
+# 脚本里有代码级兜底，这里再加一层。
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUTF8=1
+ExecStart=/usr/bin/env python3 webui.py -host ${WEB_HOST} -port ${WEB_PORT} -token ${WEB_TOKEN} -run-args "-source asn -max 200 -run -- -threads 30 -d 3 -log -quiet"
 Restart=always
 RestartSec=10
 StandardOutput=journal
