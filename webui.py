@@ -237,9 +237,10 @@ def serve_ips(qs):
 
 
 CHANNELS = [
-    ("bark", "iOS · Bark App", "https://api.day.app/你的key"),
-    ("ntfy", "全平台 / 可自建", "https://ntfy.sh/你的topic"),
-    ("pushdeer", "开源 iOS/Android", "https://api2.pushdeer.com"),
+    ("pushplus", "推送加 PushPlus（微信）", "你的 token（pushplus.plus 获取）"),
+    ("bark", "Bark（iOS）", "https://api.day.app/你的key"),
+    ("ntfy", "ntfy（全平台/可自建）", "https://ntfy.sh/你的topic"),
+    ("pushdeer", "PushDeer（开源 iOS/Android）", "https://api2.pushdeer.com"),
     ("serverchan", "Server酱³（微信）", "https://sctapi.ftqq.com/你的key.send"),
     ("telegram", "Telegram Bot", "<bot_token>|<chat_id>"),
     ("wecom", "企业微信群机器人", "webhook 完整地址"),
@@ -331,6 +332,157 @@ def notify_test(channel=None, target=None):
         return {"ok": False, "msg": str(e)}
 
 
+# 可在 Web 面板里改的设置。加新配置项只要往这里加一行，前端会自动渲染。
+# type: text / number / select / bool / password
+SETTING_SCHEMA = [
+    {"group": "扫描范围", "key": "ASNS", "label": "ASN 档位 / 厂商", "type": "select",
+     "options": [["niche", "niche · 小众优质线路（约 4000 网段，几十秒一轮）"],
+                 ["vps", "vps · 主流便宜 VPS（约 22 万网段）"],
+                 ["all", "all · 除大陆外全部（约 204 万网段，一轮约 4 小时）"]],
+     "hint": "也可以直接写厂商名，逗号分隔：alibaba,tencent,dmit,akile,cloudie…"},
+    {"group": "扫描范围", "key": "ASN_SAMPLE", "label": "每轮采样多少个 /24", "type": "number",
+     "hint": "0 = 全量不采样（vps 档位约 18 万个网段，一轮 1~2 小时）"},
+    {"group": "扫描范围", "key": "ASN_EXCLUDE_REGIONS", "label": "排除地区（黑名单）", "type": "text",
+     "hint": "默认 CN，留空 = 不排除"},
+    {"group": "扫描范围", "key": "ASN_REGIONS", "label": "只要地区（白名单）", "type": "text",
+     "hint": "留空 = 不启用；填 HK,JP,SG 就只要这些"},
+    {"group": "扫描范围", "key": "PORTS", "label": "测试端口", "type": "text",
+     "hint": "CF 的 HTTPS 端口：443,2053,2083,2087,2096,8443。注意是乘法，6 个端口 = 探测点数 ×6"},
+    {"group": "扫描范围", "key": "LIST_URLS", "label": "第三方列表源", "type": "text",
+     "hint": "zip / wwuyi / luuaiyan / xgonce / muhaip，或完整 URL"},
+
+    {"group": "运行参数", "key": "THREADS", "label": "并发线程数", "type": "number",
+     "hint": "VPS 建议 50~200"},
+    {"group": "运行参数", "key": "LOOP", "label": "每轮间隔（秒）", "type": "number",
+     "hint": "1800 = 半小时一轮"},
+
+    {"group": "筛选与排序", "key": "MAX_LATENCY_MS", "label": "延迟上限（ms）", "type": "number",
+     "hint": "超过就淘汰"},
+    {"group": "筛选与排序", "key": "MAX_LOSS_PCT", "label": "丢包上限（%）", "type": "number",
+     "hint": "超过就淘汰。丢包比延迟更致命"},
+    {"group": "筛选与排序", "key": "MIN_SPEED_MBPS", "label": "速度下限（MB/s）", "type": "number",
+     "hint": ""},
+    {"group": "筛选与排序", "key": "TOP_N", "label": "最终保留前 N 个", "type": "number",
+     "hint": "0 = 不限制。推 DNS 用 150~200 够"},
+
+    {"group": "推送", "key": "NOTIFY_CHANNEL", "label": "渠道", "type": "select",
+     "options": [["", "（不推送）"], ["pushplus", "推送加 PushPlus（微信）"],
+                 ["bark", "Bark（iOS）"], ["ntfy", "ntfy（全平台/可自建）"],
+                 ["pushdeer", "PushDeer（开源）"], ["serverchan", "Server酱³（微信）"],
+                 ["telegram", "Telegram Bot"], ["wecom", "企业微信机器人"],
+                 ["dingtalk", "钉钉机器人"], ["feishu", "飞书机器人"],
+                 ["webhook", "通用 Webhook"]],
+     "hint": "选 PushPlus 就在下面填 token（pushplus.plus 个人中心获取）"},
+    {"group": "推送", "key": "NOTIFY_TARGET", "label": "目标 / token", "type": "password",
+     "hint": "PushPlus 填 token；webhook 类填完整地址；telegram 填 <bot_token>|<chat_id>"},
+    {"group": "推送", "key": "NOTIFY_ONLY_WITH_RESULT", "label": "没有可用 IP 时不推送",
+     "type": "bool", "hint": ""},
+
+    {"group": "数据源", "key": "LIST_REGIONS", "label": "列表源地区过滤", "type": "text",
+     "hint": "如 HK,JP,SG,KR,TW"},
+    {"group": "数据源", "key": "IPDB_TYPES", "label": "IPDB 列表类型", "type": "text",
+     "hint": "bestproxy;cfv4;proxy"},
+]
+
+SECRET_KEYS = {"NOTIFY_TARGET", "FOFA_KEY", "token"}
+
+
+def _read_cfg_text():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def load_settings():
+    """读所有可编辑设置，返回 {值, schema}。密钥类做掩码。"""
+    vals = {}
+    try:
+        import ip as _ip
+        cfg = _ip.load_config(CONFIG_PATH)
+        for item in SETTING_SCHEMA:
+            k = item["key"]
+            v = cfg.get(k, "")
+            if v is None:
+                v = ""
+            vals[k] = "" if isinstance(v, bool) and not v else (
+                v if not isinstance(v, bool) else "true")
+            if isinstance(v, bool):
+                vals[k] = "true" if v else "false"
+            else:
+                vals[k] = str(v)
+    except Exception as e:                       # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+    masked = {}
+    for k, v in vals.items():
+        masked[k] = (_mask(v, 8) if (k in SECRET_KEYS and v) else v)
+    return {"ok": True, "values": masked, "schema": SETTING_SCHEMA,
+            "secret_keys": sorted(SECRET_KEYS)}
+
+
+def save_settings(payload):
+    """把设置写回 config.ini。只动 schema 里列出的键。"""
+    import re as _re
+    txt = _read_cfg_text()
+    if not txt:
+        return False, "读不到 config.ini"
+
+    changed = []
+    for item in SETTING_SCHEMA:
+        k = item["key"]
+        if k not in payload:
+            continue
+        v = payload[k]
+        if isinstance(v, bool):
+            v = "true" if v else "false"
+        v = str(v).strip()
+        # 掩码值原样提交时不要覆盖真实密钥
+        if k in SECRET_KEYS and ("…" in v or v == ""):
+            if "…" in v:
+                continue
+        if item["type"] in ("number",):
+            if v != "" and not _re.fullmatch(r"-?\d+(\.\d+)?", v):
+                return False, f"{item['label']} 必须是数字，收到「{v}」"
+        if item["type"] == "bool":
+            v = "true" if v.lower() in ("true", "1", "yes", "on") else "false"
+        if item["type"] in ("text", "password", "select") and v != "" and \
+                not _re.fullmatch(r"-?\d+(\.\d+)?", v):
+            v = f'"{v}"'
+        pat = _re.compile(rf"^{_re.escape(k)}\s*=.*$", _re.M)
+        if pat.search(txt):
+            txt = pat.sub(lambda _m, _l=f"{k} = {v}": _l, txt, count=1)
+        else:
+            txt += f"\n{k} = {v}\n"
+        changed.append(k)
+
+    try:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(txt)
+        os.replace(tmp, CONFIG_PATH)
+    except OSError as e:
+        return False, f"写 config.ini 失败: {e}"
+    return True, f"已保存 {len(changed)} 项（下一轮生效，无需重启）"
+
+
+def restart_service(name="cfip"):
+    """重启扫描服务。只允许重启 cfip / cfip-web，避免被当成通用命令执行器。"""
+    if name not in ("cfip", "cfip-web"):
+        return {"ok": False, "msg": "只允许重启 cfip / cfip-web"}
+    try:
+        r = subprocess.run(["systemctl", "restart", name],
+                           capture_output=True, timeout=30)
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode("utf-8", "replace")[:200]
+            return {"ok": False, "msg": f"重启失败：{err or r.returncode}"}
+        return {"ok": True, "msg": f"{name} 已重启"}
+    except FileNotFoundError:
+        return {"ok": False, "msg": "这台机器没有 systemctl（不是 systemd 环境）"}
+    except Exception as e:                       # noqa: BLE001
+        return {"ok": False, "msg": str(e)}
+
+
 # ==================== 页面 ====================
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN"><head>
@@ -399,34 +551,31 @@ PAGE = r"""<!DOCTYPE html>
 
 <div class="two">
   <div class="card">
-    <h2>推送设置</h2>
-    <div class="k">渠道</div>
-    <div class="row" style="margin-bottom:10px">
-      <select id="nch"></select>
-      <span id="nstate" class="sub" style="margin:0"></span>
+    <h2>设置 <span class="k" id="cfgmsg" style="margin:0"></span></h2>
+    <div id="cfgform">加载中…</div>
+    <div class="row" style="margin:14px 0 0">
+      <button id="cfgsave">保存设置</button>
+      <button class="gray sm" id="cfgreload">重新读取</button>
+      <button class="gray sm" id="svcrestart">重启扫描服务</button>
     </div>
-    <div class="k">目标（key / webhook 地址）</div>
-    <div class="row" style="margin-bottom:10px">
-      <input id="ntg" placeholder="https://api.day.app/你的key">
+    <div class="hint">
+      保存后写入 config.ini，<b>下一轮自动生效，不用重启</b>（脚本每轮会重读配置）。<br>
+      只有改了 systemd unit 里的东西才需要「重启扫描服务」。
     </div>
-    <div class="row" style="margin-bottom:6px">
-      <label class="sub" style="margin:0"><input type="checkbox" id="nonly" style="width:auto;min-width:0"> 没有可用 IP 时不推送</label>
-    </div>
-    <div class="row" style="margin:0">
-      <button id="nsave">保存</button>
-      <button class="gray sm" id="ntest">发测试推送</button>
-      <span id="nmsg" class="sub" style="margin:0"></span>
-    </div>
-    <div class="hint">保存后写入 config.ini，下一轮生效。测试会真的发到你手机。</div>
   </div>
 
   <div class="card">
-    <h2>推送内容预览</h2>
+    <h2>推送</h2>
     <div class="row" style="margin-bottom:8px">
+      <button class="gray sm" id="ntest">发测试推送</button>
       <button class="gray sm" id="nprev">刷新预览</button>
-      <span class="k" id="prevTitle" style="margin:0"></span>
+      <span id="nmsg" class="sub" style="margin:0"></span>
     </div>
+    <div class="k" id="prevTitle" style="margin-bottom:6px"></div>
     <pre id="prev">点「刷新预览」看下一轮会推什么</pre>
+    <div class="hint">
+      渠道和目标在左边的「推送」分组里选。PushPlus 直接填 token 就行。
+    </div>
   </div>
 </div>
 
@@ -499,34 +648,72 @@ async function refresh(){
   }
 }
 
-async function loadNotify(){
-  try{
-    const n = await api('/api/notify');
-    const sel = document.getElementById('nch');
-    sel.innerHTML = '<option value="">（不推送）</option>' +
-      (n.channels||[]).map(([v,label,tip])=>'<option value="'+v+'">'+esc(label)+'</option>').join('');
-    sel.value = n.channel || '';
-    document.getElementById('ntg').value = n.target || '';
-    document.getElementById('nonly').checked = !!n.only_with_result;
-    document.getElementById('nstate').innerHTML = n.configured
-      ? '<span class="pill on">已配置</span>' : '<span class="pill idle">未配置</span>';
-  }catch(e){ document.getElementById('nstate').textContent = '读取失败'; }
+let CFG = {values:{}, schema:[], secret_keys:[]};
+
+function fieldHtml(it, v){
+  const id = 'cfg_' + it.key;
+  let input;
+  if (it.type === 'select') {
+    input = '<select id="'+id+'">' + (it.options||[]).map(([val,label])=>
+      '<option value="'+esc(val)+'"'+(String(v)===String(val)?' selected':'')+'>'+esc(label)+'</option>').join('') + '</select>';
+  } else if (it.type === 'bool') {
+    input = '<label class="sub" style="margin:0"><input type="checkbox" id="'+id+'" style="width:auto;min-width:0"'
+          + (String(v)==='true'?' checked':'') + '> 开启</label>';
+  } else {
+    const ph = it.type === 'password' ? '（已设置，留空则不修改）' : '';
+    input = '<input id="'+id+'" type="'+(it.type==='password'?'text':'text')+'" value="'+esc(v)+'" placeholder="'+ph+'">';
+  }
+  return '<div style="margin-bottom:11px">'
+       + '<div class="k" style="margin-bottom:4px">'+esc(it.label)+'</div>'
+       + '<div class="row" style="margin:0">'+input+'</div>'
+       + (it.hint ? '<div class="hint">'+esc(it.hint)+'</div>' : '')
+       + '</div>';
 }
+
+function renderSettings(){
+  const groups = {};
+  (CFG.schema||[]).forEach(it => { (groups[it.group] = groups[it.group]||[]).push(it); });
+  document.getElementById('cfgform').innerHTML = Object.keys(groups).map(g =>
+    '<div style="margin-bottom:16px"><div style="font-weight:600;margin-bottom:9px;color:#cfd6e6">'
+    + esc(g) + '</div>'
+    + groups[g].map(it => fieldHtml(it, CFG.values[it.key]||'')).join('')
+    + '</div>').join('');
+}
+
+async function loadSettings(){
+  try{
+    const r = await api('/api/config');
+    if (!r.ok) { document.getElementById('cfgform').innerHTML = '<span class="err">'+esc(r.error)+'</span>'; return; }
+    CFG = r; renderSettings();
+  }catch(e){ document.getElementById('cfgform').innerHTML = '<span class="err">读取失败：'+esc(e.message)+'</span>'; }
+}
+
+document.getElementById('cfgsave').onclick = async () => {
+  const m = document.getElementById('cfgmsg'); m.textContent = '保存中…';
+  const payload = {};
+  (CFG.schema||[]).forEach(it => {
+    const el = document.getElementById('cfg_'+it.key);
+    if (!el) return;
+    payload[it.key] = (it.type === 'bool') ? el.checked : el.value;
+  });
+  const r = await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'},
+                                      body: JSON.stringify(payload)});
+  m.innerHTML = r.ok ? '<span class="ok">'+esc(r.msg)+'</span>' : '<span class="err">'+esc(r.msg)+'</span>';
+  if (r.ok) { setTimeout(loadSettings, 600); }
+};
+document.getElementById('cfgreload').onclick = loadSettings;
+document.getElementById('svcrestart').onclick = async () => {
+  const m = document.getElementById('cfgmsg'); m.textContent = '重启中…';
+  const r = await api('/api/service', {method:'POST', headers:{'Content-Type':'application/json'},
+                                       body: JSON.stringify({name:'cfip'})});
+  m.innerHTML = r.ok ? '<span class="ok">'+esc(r.msg)+'</span>' : '<span class="err">'+esc(r.msg)+'</span>';
+};
 
 document.getElementById('refresh').onclick = refresh;
 document.getElementById('nprev').onclick = async () => {
   const p = await api('/api/notify/preview');
   document.getElementById('prevTitle').textContent = p.ok ? (p.title + '  ·  ' + p.rows + ' 个 IP') : '';
   document.getElementById('prev').textContent = p.ok ? p.body : ('生成失败：' + p.error);
-};
-document.getElementById('nsave').onclick = async () => {
-  const m = document.getElementById('nmsg'); m.textContent = '保存中…';
-  const r = await api('/api/notify', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({channel: document.getElementById('nch').value,
-                          target: document.getElementById('ntg').value,
-                          only_with_result: document.getElementById('nonly').checked})});
-  m.innerHTML = r.ok ? '<span class="ok">'+esc(r.msg)+'</span>' : '<span class="err">'+esc(r.msg)+'</span>';
-  loadNotify();
 };
 document.getElementById('ntest').onclick = async () => {
   const m = document.getElementById('nmsg'); m.textContent = '发送中…';
@@ -543,7 +730,7 @@ document.getElementById('run').onclick = async () => {
   }catch(e){ m.textContent = '失败：' + e.message; }
   setTimeout(()=>{ b.disabled = false; refresh(); }, 1500);
 };
-refresh(); loadNotify(); setInterval(refresh, 3000);
+refresh(); loadSettings(); setInterval(refresh, 3000);
 </script></body></html>
 """
 
@@ -604,6 +791,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(load_notify_settings())
         if u.path == "/api/notify/preview":
             return self._json(notify_preview())
+        if u.path == "/api/config":
+            return self._json(load_settings())
         return self._json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -626,6 +815,21 @@ class Handler(BaseHTTPRequestHandler):
                 str(payload.get("target") or "").strip(),
                 bool(payload.get("only_with_result", True)))
             return self._json({"ok": ok, "msg": msg})
+        if u.path == "/api/config":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                return self._json({"ok": False, "msg": f"请求体不是 JSON: {e}"}, 400)
+            ok, msg = save_settings(payload)
+            return self._json({"ok": ok, "msg": msg})
+        if u.path == "/api/service":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = {}
+            return self._json(restart_service(str(payload.get("name") or "cfip")))
         return self._json({"error": "not found"}, 404)
 
 

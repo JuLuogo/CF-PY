@@ -5,6 +5,7 @@
 纯标准库实现。支持常见的推送渠道，填哪个用哪个：
 
   bark        iOS，Bark App           target = https://api.day.app/你的key
+  pushplus    推送加 PushPlus（微信）   target = 你的 token
   pushdeer    开源，iOS/Android       target = https://api2.pushdeer.com   key = pushkey
   ntfy        开源，全平台/可自建      target = https://ntfy.sh/你的topic
   serverchan  Server酱³（微信）        target = https://sctapi.ftqq.com/你的key.send
@@ -152,6 +153,24 @@ def send(title, body):
             st, _ = _post(url + "?group=CF-IP&isArchive=1")
             return st == 200, f"HTTP {st}"
 
+        if ch == "pushplus":
+            # 推送加 PushPlus：target 直接填 token（pushplus.plus 个人中心获取）
+            # 也允许填完整地址，那就从 URL 里把 token 抠出来
+            token = tgt
+            if "/" in tgt:
+                m = re.search(r"[?&]token=([^&\s]+)", tgt) or re.search(r"/([0-9a-zA-Z]{16,})", tgt)
+                token = m.group(1) if m else tgt
+            st, txt = _post("https://www.pushplus.plus/send",
+                            data={"token": token, "title": title,
+                                  "content": body, "template": "txt"})
+            ok = False
+            try:
+                j = json.loads(txt)
+                ok = str(j.get("code")) == "200"
+                return ok, f"HTTP {st} {j.get('msg', txt[:80])}"
+            except json.JSONDecodeError:
+                return st == 200, f"HTTP {st} {txt[:80]}"
+
         if ch == "pushdeer":
             url = tgt.rstrip("/") + "/message/push"
             st, _ = _post(url, data={"text": title, "desp": body, "type": "markdown"})
@@ -232,6 +251,7 @@ if __name__ == "__main__":
     if a.list:
         print("支持的渠道：")
         for c, d in [("bark", "iOS，target=https://api.day.app/你的key"),
+                     ("pushplus", "推送加 PushPlus（微信），target=你的 token"),
                      ("pushdeer", "开源，target=https://api2.pushdeer.com"),
                      ("ntfy", "开源全平台，target=https://ntfy.sh/你的topic"),
                      ("serverchan", "Server酱³，target=https://sctapi.ftqq.com/你的key.send"),

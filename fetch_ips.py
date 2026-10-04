@@ -260,6 +260,7 @@ def apply_config(cfg):
     global IPDB_CF_SAMPLE, LIST_URLS, LIST_TIMEOUT, LIST_REGIONS
     global ASNS, ASN_SAMPLE, ASN_REGIONS, ASN_EXCLUDE_REGIONS
     global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
+    global THREADS, LOOP
 
     get = cfg.get
     if "FOFA_API_BASE" in cfg:        FOFA_API_BASE = str(get("FOFA_API_BASE")).strip() or FOFA_API_BASE
@@ -304,6 +305,8 @@ def apply_config(cfg):
     if "NOTIFY_ONLY_WITH_RESULT" in cfg:
         NOTIFY_ONLY_WITH_RESULT = as_bool(get("NOTIFY_ONLY_WITH_RESULT"), NOTIFY_ONLY_WITH_RESULT)
     if "PORTS" in cfg:                PORTS = str(get("PORTS") or "").strip()
+    if "THREADS" in cfg:              THREADS = as_int(get("THREADS"), THREADS)
+    if "LOOP" in cfg:                 LOOP = as_int(get("LOOP"), LOOP)
 
 
 def apply_env():
@@ -314,6 +317,7 @@ def apply_env():
     global FOFA_EMAIL, FOFA_KEY, FOFA_REGIONS
     global ASNS, ASN_SAMPLE, ASN_REGIONS, ASN_EXCLUDE_REGIONS
     global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
+    global THREADS, LOOP
     global LIST_URLS, LIST_REGIONS, IPDB_TYPES, IPDB_CF_SAMPLE
 
     env = os.environ.get
@@ -898,6 +902,11 @@ NOTIFY_ONLY_WITH_RESULT = True  # 没有可用 IP 时不推送（免得白刷屏
 # 只测 443 会丢掉近一半的反代（公开列表里 443 只占 57%，其余都在这些端口上）。
 # 留空字符串表示不限制（列表源里是什么端口就测什么）。
 PORTS = "443"
+
+# 扫描线程数与循环间隔也放进配置，这样 Web 面板能直接控制，
+# 不用去改 systemd unit 文件。
+THREADS = 20
+LOOP = 1800
 
 # 进度上报节流用（避免把 status.json 刷爆）
 _prog_last = {}
@@ -2001,6 +2010,63 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
 
 
 # ==================== Main ====================
+def apply_cli(a, quiet_banner=False):
+    """把命令行参数套到全局配置上（优先级：命令行 > 环境变量 > config.ini）。
+
+    抽成函数是因为循环模式下每轮都会重读 config.ini，
+    重读之后必须再把命令行覆盖套一遍，否则命令行会被配置盖掉。
+    """
+    global FOFA_KEY, FOFA_EMAIL, FOFA_REGIONS, FOFA_CSV_OUTPUT, FOFA_PRESET
+    global FOFA_QUERY_TEMPLATE, FOFA_MAX_PER_REGION, FOFA_FIELDS, DEBUG, IPDB_TYPES
+    global IPDB_CF_SAMPLE, LIST_URLS, LIST_REGIONS, ASNS, ASN_SAMPLE, ASN_REGIONS
+    global ASN_EXCLUDE_REGIONS, NOTIFY_CHANNEL, NOTIFY_TARGET, PORTS, THREADS, LOOP
+
+    if a.debug:
+        DEBUG = True
+    if a.key:
+        FOFA_KEY = a.key.strip()
+    if a.email:
+        FOFA_EMAIL = a.email.strip()
+    if a.regions:
+        FOFA_REGIONS = a.regions
+    if a.size is not None:
+        FOFA_MAX_PER_REGION = max(1, a.size)
+    if a.output:
+        FOFA_CSV_OUTPUT = a.output
+    if a.preset:
+        FOFA_PRESET = a.preset
+    if a.query:
+        FOFA_QUERY_TEMPLATE = a.query.strip()
+    if a.fields:
+        FOFA_FIELDS = a.fields.strip()
+    if a.ipdb_types is not None:
+        IPDB_TYPES = a.ipdb_types.strip()
+    if a.list_urls is not None:
+        LIST_URLS = a.list_urls.strip()
+    if a.list_regions is not None:
+        LIST_REGIONS = a.list_regions.strip()
+    if a.asns is not None:
+        ASNS = a.asns.strip()
+    if a.asn_sample is not None:
+        # 注意不能用 max(1, ...)：0 是有意义的值，表示「全量不采样」。
+        # 写成 max(1, 0) 会把全量模式悄悄变成「只取 1 个」。
+        ASN_SAMPLE = max(0, a.asn_sample)
+        if ASN_SAMPLE > 2000 and not quiet_banner:
+            log(f"[!] -asn-sample {ASN_SAMPLE} 偏大。扫描第三方网段请克制，建议 50~200；")
+            log("    真要全量扫就填 0（表示不采样、扫全部 /24）。")
+    if a.asn_regions is not None:
+        ASN_REGIONS = a.asn_regions.strip()
+    if a.asn_exclude_regions is not None:
+        ASN_EXCLUDE_REGIONS = a.asn_exclude_regions.strip()
+    if a.ports is not None:
+        PORTS = a.ports.strip()
+    if a.cf_sample is not None:
+        IPDB_CF_SAMPLE = max(0, a.cf_sample)
+        if IPDB_CF_SAMPLE > 200 and not quiet_banner:
+            log(f"[!] -cf-sample {IPDB_CF_SAMPLE} 偏大。官方网段采样建议 10~50，")
+            log("    采样再多也是在同一个 anycast 网络里打转，收益递减还费时间。")
+
+
 def main():
     global FOFA_KEY, FOFA_EMAIL, FOFA_REGIONS, FOFA_CSV_OUTPUT, FOFA_PRESET
     global FOFA_QUERY_TEMPLATE, FOFA_MAX_PER_REGION, FOFA_FIELDS, DEBUG, IPDB_TYPES
@@ -2076,54 +2142,19 @@ def main():
             print(line)
         return 0
 
-    if a.debug:
-        DEBUG = True
-    if a.key:
-        FOFA_KEY = a.key.strip()
-    if a.email:
-        FOFA_EMAIL = a.email.strip()
-    if a.regions:
-        FOFA_REGIONS = a.regions
-    if a.size is not None:
-        FOFA_MAX_PER_REGION = max(1, a.size)
-    if a.output:
-        FOFA_CSV_OUTPUT = a.output
-    if a.preset:
-        FOFA_PRESET = a.preset
-    if a.query:
-        FOFA_QUERY_TEMPLATE = a.query.strip()
-    if a.fields:
-        FOFA_FIELDS = a.fields.strip()
-    if a.ipdb_types is not None:
-        IPDB_TYPES = a.ipdb_types.strip()
-    if a.list_urls is not None:
-        LIST_URLS = a.list_urls.strip()
-    if a.list_regions is not None:
-        LIST_REGIONS = a.list_regions.strip()
-    if a.asns is not None:
-        ASNS = a.asns.strip()
-    if a.asn_sample is not None:
-        # 注意不能用 max(1, ...)：0 是有意义的值，表示「全量不采样」。
-        # 写成 max(1, 0) 会把全量模式悄悄变成「只取 1 个」。
-        ASN_SAMPLE = max(0, a.asn_sample)
-        if ASN_SAMPLE > 2000:
-            log(f"[!] -asn-sample {ASN_SAMPLE} 偏大。扫描第三方网段请克制，建议 50~200；")
-            log("    真要全量扫就填 0（表示不采样、扫全部 /24）。")
-    if a.asn_regions is not None:
-        ASN_REGIONS = a.asn_regions.strip()
-    if a.asn_exclude_regions is not None:
-        ASN_EXCLUDE_REGIONS = a.asn_exclude_regions.strip()
-    if a.ports is not None:
-        PORTS = a.ports.strip()
-    if a.cf_sample is not None:
-        IPDB_CF_SAMPLE = max(0, a.cf_sample)
-        if IPDB_CF_SAMPLE > 200:
-            log(f"[!] -cf-sample {IPDB_CF_SAMPLE} 偏大。官方网段采样建议 10~50，")
-            log("    采样再多也是在同一个 anycast 网络里打转，收益递减还费时间。")
+    apply_cli(a, quiet_banner=True)
 
     # 清掉 -run 之后可能被 argparse 吞掉的 "--" 分隔符
     passthrough = [x for x in passthrough if x != "--"]
     extra_run_args = passthrough + ([x for x in FOFA_RUN_ARGS.split() if x] if FOFA_RUN_ARGS else [])
+    # 透传参数里没写 -threads 就用配置里的 THREADS，
+    # 这样 Web 面板改线程数就能生效，不用动 systemd unit。
+    if "-threads" not in extra_run_args and THREADS:
+        extra_run_args += ["-threads", str(THREADS)]
+    if "-d" not in extra_run_args:
+        extra_run_args += ["-d", "5"]
+    if "-log" not in extra_run_args:
+        extra_run_args += ["-log", "-quiet"]
 
     source = a.source
     if source == "auto":
@@ -2138,7 +2169,7 @@ def main():
         else:
             source = "fofa"
 
-    interval = max(0, a.loop or 0)
+    interval = max(0, a.loop or LOOP)
     round_no = 0
     st0 = cleanup_outputs()
     log(f"[*] 磁盘：可用 {st0['free_mb']} MB，清理释放 {st0['freed_mb']} MB "
@@ -2147,6 +2178,18 @@ def main():
                  asns=ASNS, asn_sample=ASN_SAMPLE, free_mb=st0["free_mb"])
     while True:
         round_no += 1
+        if round_no > 1:
+            # 每轮重读 config.ini —— 这样在 Web 面板改的设置下一轮就生效，
+            # 不用重启服务。重读后要把命令行覆盖再套一遍（它优先级最高）。
+            try:
+                apply_config(load_config(config_path))
+                apply_env()
+                apply_cli(a, quiet_banner=True)
+                interval = max(0, a.loop or LOOP)
+                log(f"[*] 已重新加载 config.ini（间隔 {interval}s，"
+                    f"档位 {ASNS}，采样 {ASN_SAMPLE}，端口 {PORTS}）")
+            except Exception as e:               # noqa: BLE001
+                log(f"[!] 重读配置失败，沿用上一轮的配置：{e}")
         disk_guard()
         try:
             rc = run_once(a, source, extra_run_args, round_no, interval)
