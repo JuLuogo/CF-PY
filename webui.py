@@ -103,6 +103,28 @@ def load_results():
         return {"error": str(e), "ip_txt": [], "rows": []}
 
 
+def load_pool(limit=500, region=None):
+    """从累积池里读结果。这是给下游用的【主数据源】。
+
+    为什么主数据源是池子而不是「最近一轮」：
+      上游 5~7 天才跑一轮，单轮结果会波动。池子是累积的，
+      只增不减（除非条目 30 天没再出现），下游拿到的才是稳定的。
+    """
+    try:
+        import fetch_ips as ff
+        return ff.read_pool_rows(limit=limit, region=region)
+    except Exception as e:                       # noqa: BLE001
+        return []
+
+
+def load_pool_summary():
+    try:
+        import fetch_ips as ff
+        return ff.pool_summary()
+    except Exception:                            # noqa: BLE001
+        return {"total": 0}
+
+
 def load_results_region():
     """读第二套（只含白名单地区）的结果文件。"""
     tag, want = _region_tag()
@@ -241,15 +263,29 @@ def serve_ips(qs):
     min_speed = _num((qs.get("min_speed") or [""])[0])
     want_cc = {c.strip().upper() for c in (qs.get("country") or [""])[0].split(",") if c.strip()}
 
-    which = (qs.get("set") or ["all"])[0].lower()
-    if which in ("region", "regions", "area", "cn", "filtered"):
-        res = load_results_region()
-        if not res.get("exists"):
-            return {"error": "还没有地区列表。等一轮跑完，或检查 OUTPUT_REGIONS 配置",
-                    "set": "region", "regions": res.get("regions") or []}
-    else:
+    which = (qs.get("set") or ["pool"])[0].lower()
+    # 数据源：
+    #   pool（默认）累积池，只增不减 —— 下游应该用这个
+    #   region      池子里只要白名单地区的
+    #   last        只看最近一轮的结果（调试用）
+    #   all         同 pool，兼容旧写法
+    if which in ("last", "round", "latest"):
         res = load_results()
-    rows = res.get("rows") or []
+        rows = res.get("rows") or []
+    else:
+        region = None
+        if which in ("region", "regions", "area", "filtered"):
+            _tag, region = _region_tag()
+            if not region:
+                return {"error": "OUTPUT_REGIONS 没配置，无法筛选地区",
+                        "set": "region"}
+        pool_rows = load_pool(limit=100000, region=set(region) if region else None)
+        if not pool_rows:
+            # 池子还空着（第一次跑之前），退回最近一轮
+            res = load_results()
+            rows = res.get("rows") or []
+        else:
+            rows = pool_rows
 
     # 没有 CSV（比如只跑了 -stage1）就退回 ip.txt，直接给纯 IP
     if not rows:
@@ -275,7 +311,10 @@ def serve_ips(qs):
             continue
         if want_cc and cc not in want_cc:
             continue
-        out.append({"ip": r.get("ip", ""), "latency": lat, "loss": loss, "speed": spd,
+        out.append({"ip": r.get("ip", ""), "port": r.get("port", "443"),
+                    "last_seen": r.get("last_seen", ""),
+                    "seen_count": r.get("seen_count", ""),
+                    "latency": lat, "loss": loss, "speed": spd,
                     "score": _num(r.get("score")), "country": cc,
                     "city": r.get("city", ""), "route": r.get("route", ""),
                     "cfcountry": r.get("cfcountry", "")})
@@ -928,6 +967,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(load_results())
         if u.path == "/api/results/region":
             return self._json(load_results_region())
+        if u.path == "/api/pool":
+            return self._json({"summary": load_pool_summary(),
+                               "rows": load_pool(limit=500)})
         if u.path == "/api/ips":
             fmt = (qs.get("format") or ["text"])[0].lower()
             ctype = {"json": "application/json; charset=utf-8",

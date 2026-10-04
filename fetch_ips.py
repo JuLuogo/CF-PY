@@ -46,7 +46,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_FILE = os.path.join(HERE, "config.ini")
@@ -262,6 +262,7 @@ def apply_config(cfg):
     global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
     global THREADS, LOOP
     global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE, FULL_SCAN
+    global POOL_ENABLED, POOL_FILE, POOL_MAX_AGE_DAYS
 
     get = cfg.get
     if "FOFA_API_BASE" in cfg:        FOFA_API_BASE = str(get("FOFA_API_BASE")).strip() or FOFA_API_BASE
@@ -308,6 +309,9 @@ def apply_config(cfg):
     if "PORTS" in cfg:                PORTS = str(get("PORTS") or "").strip()
     if "CHUNK_SIZE" in cfg:          CHUNK_SIZE = as_int(get("CHUNK_SIZE"), CHUNK_SIZE)
     if "FULL_SCAN" in cfg:            FULL_SCAN = as_bool(get("FULL_SCAN"), FULL_SCAN)
+    if "POOL_ENABLED" in cfg:         POOL_ENABLED = as_bool(get("POOL_ENABLED"), POOL_ENABLED)
+    if "POOL_FILE" in cfg:            POOL_FILE = str(get("POOL_FILE") or POOL_FILE).strip().strip('"')
+    if "POOL_MAX_AGE_DAYS" in cfg:    POOL_MAX_AGE_DAYS = as_int(get("POOL_MAX_AGE_DAYS"), POOL_MAX_AGE_DAYS)
     if "OUTPUT_REGIONS" in cfg:
         OUTPUT_REGIONS = str(get("OUTPUT_REGIONS") or "").strip().strip('"')
     if "OUTPUT_SPLIT" in cfg:         OUTPUT_SPLIT = as_bool(get("OUTPUT_SPLIT"), OUTPUT_SPLIT)
@@ -1709,6 +1713,160 @@ def clear_progress(*keys):
     write_status(progress=prog)
 
 
+# ==================== 累积 IP 池 ====================
+# 为什么需要池子而不是每轮覆盖：
+#   这个系统的分工是「上游慢而全地发现、下游快而准地挑」。
+#   上游 5~7 天才跑一轮，如果每轮覆盖输出，那么某一轮赶上网络抖动、
+#   被限流、或者只跑了一部分就重启，池子就会【缩水】——
+#   下游拿到的反而比上一轮少，DNS 里会出现空窗。
+#
+#   正确做法：每轮的结果【并进】池子，记录 last_seen，
+#   只有连续 N 天没再被确认可用的才淘汰。这样池子只会越来越大、
+#   越来越准，单轮波动不影响下游。
+POOL_ENABLED = True
+POOL_FILE = "./output/pool.csv"
+POOL_MAX_AGE_DAYS = 30      # 超过这么多天没再出现的条目才淘汰
+
+POOL_HEADER = ["ip", "port", "first_seen", "last_seen", "seen_count",
+               "latency", "loss", "speed", "score",
+               "cfcountry", "country", "city", "route", "colo"]
+
+
+def _pool_path():
+    return POOL_FILE if os.path.isabs(POOL_FILE) else os.path.join(HERE, POOL_FILE)
+
+
+def load_pool():
+    """读池子。返回 {('ip','port'): row}。"""
+    path = _pool_path()
+    out = {}
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                ip = (row.get("ip") or "").strip()
+                port = (row.get("port") or "443").strip() or "443"
+                if ip:
+                    out[(ip, port)] = row
+    except (OSError, csv.Error):
+        pass
+    return out
+
+
+def _fnum(v):
+    try:
+        return float(str(v).replace("ms", "").replace("%", "").replace("MB/s", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def merge_pool(rows, prune=True):
+    """把一轮的结果并进池子。返回 (池子总数, 本轮新增, 本轮更新, 淘汰数)。
+
+    同一个 ip:port 再次出现时：更新 last_seen / 指标，seen_count +1，
+    保留最早的 first_seen —— 这样能看出一个 IP 到底稳定了多久。
+    """
+    if not POOL_ENABLED:
+        return 0, 0, 0, 0
+
+    pool = load_pool()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    added = updated = 0
+
+    for r in rows or []:
+        ip = (r.get("ip") or "").strip()
+        if not ip:
+            continue
+        port = str(r.get("port") or "443").strip() or "443"
+        key = (ip, port)
+        old = pool.get(key)
+        if old:
+            updated += 1
+            old.update({
+                "last_seen": now,
+                "seen_count": str(int(old.get("seen_count") or 1) + 1),
+                "latency": str(r.get("latency") or old.get("latency") or ""),
+                "loss": str(r.get("loss") or old.get("loss") or ""),
+                "speed": str(r.get("speed") or old.get("speed") or ""),
+                "score": str(r.get("score") or old.get("score") or ""),
+                "country": str(r.get("country") or old.get("country") or ""),
+                "city": str(r.get("city") or old.get("city") or ""),
+                "route": str(r.get("route") or old.get("route") or ""),
+                "cfcountry": str(r.get("cfcountry") or old.get("cfcountry") or ""),
+            })
+        else:
+            added += 1
+            pool[key] = {
+                "ip": ip, "port": port,
+                "first_seen": now, "last_seen": now, "seen_count": "1",
+                "latency": str(r.get("latency") or ""),
+                "loss": str(r.get("loss") or ""),
+                "speed": str(r.get("speed") or ""),
+                "score": str(r.get("score") or ""),
+                "cfcountry": str(r.get("cfcountry") or ""),
+                "country": str(r.get("country") or ""),
+                "city": str(r.get("city") or ""),
+                "route": str(r.get("route") or ""),
+                "colo": str(r.get("colo") or ""),
+            }
+
+    # 淘汰太久没出现的
+    dropped = 0
+    if prune and POOL_MAX_AGE_DAYS:
+        cutoff = datetime.now() - timedelta(days=POOL_MAX_AGE_DAYS)
+        for key in list(pool.keys()):
+            ls = (pool[key].get("last_seen") or "").strip()
+            try:
+                if datetime.strptime(ls, "%Y-%m-%d %H:%M:%S") < cutoff:
+                    del pool[key]
+                    dropped += 1
+            except ValueError:
+                pass
+
+    # 写回（原子替换，避免中途崩了把池子写坏）
+    path = _pool_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=POOL_HEADER, extrasaction="ignore")
+            w.writeheader()
+            for row in pool.values():
+                w.writerow(row)
+        os.replace(tmp, path)
+    except OSError as e:
+        log(f"[!] 写池子失败：{e}")
+
+    return len(pool), added, updated, dropped
+
+
+def pool_summary():
+    """池子概览：总数、按地区分布、按新鲜度分布。给面板和推送用。"""
+    pool = load_pool()
+    if not pool:
+        return {"total": 0}
+    now = datetime.now()
+    dist, fresh = {}, {"今天": 0, "3天内": 0, "7天内": 0, "更早": 0}
+    for row in pool.values():
+        cc = (row.get("country") or "??").upper()
+        dist[cc] = dist.get(cc, 0) + 1
+        try:
+            age = (now - datetime.strptime(row.get("last_seen") or "",
+                                           "%Y-%m-%d %H:%M:%S")).days
+        except ValueError:
+            age = 999
+        if age <= 0:
+            fresh["今天"] += 1
+        elif age <= 3:
+            fresh["3天内"] += 1
+        elif age <= 7:
+            fresh["7天内"] += 1
+        else:
+            fresh["更早"] += 1
+    return {"total": len(pool), "by_country": dist, "by_freshness": fresh}
+
+
 # ==================== 每日请求额度守卫 ====================
 # 每次可用性检查 = 1 个请求打到 AVAILABILITY_HOST（你自己的域名），
 # 每次测速 = 1 个请求。如果那个域名有每日额度（比如 Cloudflare Worker
@@ -1796,6 +1954,37 @@ def write_status(**kw):
         os.replace(tmp, path)
     except OSError:
         pass
+
+
+def read_pool_rows(limit=500, region=None, max_age_days=None):
+    """从池子里读结果，按分数排序。给 Web 面板和 API 用。
+
+    region: 只要这些地区（大写集合），None = 不限
+    max_age_days: 只要最近这么多天出现过的
+    """
+    pool = load_pool()
+    if not pool:
+        return []
+    cutoff = None
+    if max_age_days:
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+    rows = []
+    for row in pool.values():
+        cc = (row.get("country") or "").upper()
+        if region and cc not in region:
+            continue
+        if cutoff is not None:
+            try:
+                if datetime.strptime(row.get("last_seen") or "",
+                                     "%Y-%m-%d %H:%M:%S") < cutoff:
+                    continue
+            except ValueError:
+                continue
+        rows.append(row)
+    # 按 score 升序（score = 延迟 x 丢包惩罚，越小越好），没有 score 的排后面
+    rows.sort(key=lambda r: (_fnum(r.get("score")) is None,
+                             _fnum(r.get("score")) or 99999))
+    return rows[:limit]
 
 
 def read_final_summary(limit=200):
@@ -2198,7 +2387,12 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
         # ---- 实测 ----
         if a.run or FOFA_RUN:
             rc, avail, qual = run_tester(csv_path, extra_run_args)
-            write_status(phase="done", test_rc=rc, final=read_final_summary())
+            final = read_final_summary()
+            if POOL_ENABLED:
+                total, added, upd, dropped = merge_pool(final.get("rows") or [])
+                log(f"[*] 池子：共 {total} 个（本轮新增 {added}，更新 {upd}，淘汰 {dropped}）")
+            write_status(phase="done", test_rc=rc, final=final,
+                         pool=pool_summary() if POOL_ENABLED else None)
             send_notification(round_no, avail, qual, loop_secs)
             return rc
         return 0
@@ -2270,7 +2464,14 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
 
     if a.run or FOFA_RUN:
         rc, avail, qual = run_tester(csv_path, extra_run_args)
-        write_status(phase="done", test_rc=rc, final=read_final_summary())
+        final = read_final_summary()
+        # 把这一轮的结果【并进】池子，而不是覆盖 ——
+        # 上游 5~7 天才跑一轮，某一轮抖动/被限流不该让下游的池子缩水
+        if POOL_ENABLED:
+            total, added, upd, dropped = merge_pool(final.get("rows") or [])
+            log(f"[*] 池子：共 {total} 个（本轮新增 {added}，更新 {upd}，淘汰 {dropped}）")
+        write_status(phase="done", test_rc=rc, final=final,
+                     pool=pool_summary() if POOL_ENABLED else None)
         send_notification(round_no, avail, qual, loop_secs)
         return rc
 
