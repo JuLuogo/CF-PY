@@ -24,3 +24,9 @@ _*.yml
 .DS_Store
 Thumbs.db
 *.swp
+
+# 运行产物
+ip.txt
+ip-*.txt
+bestips-*.csv
+output/
