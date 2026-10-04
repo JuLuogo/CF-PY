@@ -20,3 +20,5 @@ menu.py
 # 文档
 *.md
 LICENSE
+
+tests/

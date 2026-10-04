@@ -701,16 +701,30 @@ def load_ips(path):
         ccol = next((reader.fieldnames[i] for i, n in enumerate(names)
                      if n in {"country", "country_code", "cc"}), None)
         citycol = next((reader.fieldnames[i] for i, n in enumerate(names) if n == "city"), None)
+        portcol = next((reader.fieldnames[i] for i, n in enumerate(names) if n == "port"), None)
         if not ipcol:
             print("[!] CSV中没有ip列", file=sys.stderr)
             sys.exit(1)
         for row in reader:
             ip = (row.get(ipcol) or "").strip()
-            if not valid_ip(ip) or ip in seen:
+            if not valid_ip(ip):
                 continue
-            seen.add(ip)
+            # 端口：CSV 里没有 port 列或为空就默认 443。
+            # CF 支持的 HTTPS 端口是 443/2053/2083/2087/2096/8443，
+            # 只测 443 会丢掉近一半的反代（公开列表里 443 只占 57%）。
+            port = "443"
+            if portcol:
+                pv = (row.get(portcol) or "").strip()
+                if pv.isdigit() and 1 <= int(pv) <= 65535:
+                    port = pv
+            # 去重键是 ip:port —— 同一个 IP 的不同端口是两个不同的反代入口
+            key = f"{ip}:{port}"
+            if key in seen:
+                continue
+            seen.add(key)
             out.append({
                 "ip": ip,
+                "port": port,
                 "input_country": (row.get(ccol) or "").strip().upper() if ccol else "",
                 "input_city": (row.get(citycol) or "").strip() if citycol else ""
             })
@@ -719,12 +733,20 @@ def load_ips(path):
 
 
 # ==================== Stage 1 ====================
-def availability(ip, timeout=CURL_TIMEOUT_SEC):
+def availability(ip, timeout=CURL_TIMEOUT_SEC, port="443"):
+    """可用性检查。端口默认 443，也支持 CF 的其它 HTTPS 端口（2053/2083/2087/2096/8443）。
+
+    注意 URL 里也要带端口 —— 只改 --resolve 不改 URL 的话，
+    curl 还是会去连 443，测出来的结果和端口对不上。
+    """
+    port = str(port or "443")
+    suffix = "" if port == "443" else f":{port}"
     cmd = ["curl", "-sS", "-k",
            "--connect-timeout", str(timeout),
            "--max-time", str(timeout),
-           "--resolve", f"{AVAILABILITY_HOST}:443:{ip}",
-           AVAILABILITY_URL]
+           "--resolve", f"{AVAILABILITY_HOST}:{port}:{ip}",
+           AVAILABILITY_URL.replace(f"https://{AVAILABILITY_HOST}",
+                                    f"https://{AVAILABILITY_HOST}{suffix}", 1)]
     ok, out = run_command(cmd, timeout + 3)
     if not ok:
         return None
@@ -748,24 +770,27 @@ def stage1(items, threads):
     out = []
     log(f"\n[*] 第一阶段：可用性，{total} IP，{threads}线程")
     with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="avail") as ex:
-        fmap = {ex.submit(availability, x["ip"]): x for x in items}
+        fmap = {ex.submit(availability, x["ip"], CURL_TIMEOUT_SEC,
+                          str(x.get("port") or "443")): x for x in items}
         for fut in as_completed(fmap):
             x = fmap[fut]
             done += 1
             ip = x["ip"]
+            port = str(x.get("port") or "443")
+            tag = ip if port == "443" else f"{ip}:{port}"
             try:
                 cf = fut.result()
             except Exception as e:
                 cf = None
-                progress("availability", done, total, f"{ip} | DROP exception={e}")
+                progress("availability", done, total, f"{tag} | DROP exception={e}")
             if not cf:
-                progress("availability", done, total, f"{ip} | DROP: Cloudflare trace不可用")
+                progress("availability", done, total, f"{tag} | DROP: Cloudflare trace不可用")
                 continue
             y = dict(x)
             y.update(cf)
             out.append(y)
             progress("availability", done, total,
-                     f"{ip} | PASS cfcountry={y.get('cfcountry', '')} colo={y.get('colo', '-')}")
+                     f"{tag} | PASS cfcountry={y.get('cfcountry', '')} colo={y.get('colo', '-')}")
     log(f"[*] 第一阶段完成：{len(out)}/{total}")
     return out
 
@@ -834,8 +859,9 @@ def ping_latency(ip):
     return ping_stats(ip)[0]
 
 
-def speed_test(ip, bytes_to_download):
+def speed_test(ip, bytes_to_download, port="443"):
     null = "NUL" if platform.system().lower() == "windows" else "/dev/null"
+    port = str(port or "443")
     url = SPEED_TEST_URL
     range_args = []
     if "{bytes}" in url:
@@ -845,11 +871,14 @@ def speed_test(ip, bytes_to_download):
         range_args = ["--range", f"0-{max(0, bytes_to_download - 1)}"]
 
     host = urlparse(url).hostname or "speed.cloudflare.com"
+    # 非 443 端口时 URL 也要带端口，否则 curl 还是连 443
+    if port != "443":
+        url = url.replace(f"https://{host}", f"https://{host}:{port}", 1)
     cmd = ["curl", "-o", null, "-sS", "-w", "%{speed_download}",
            "--connect-timeout", str(CURL_TIMEOUT_SEC),
            "--max-time", str(SPEED_TEST_TIMEOUT)]
     cmd += range_args
-    cmd += ["--resolve", f"{host}:443:{ip}", url]
+    cmd += ["--resolve", f"{host}:{port}:{ip}", url]
 
     ok, out = run_command(cmd, SPEED_TEST_TIMEOUT + 5)
     if not ok:
@@ -864,6 +893,7 @@ def speed_test(ip, bytes_to_download):
 
 def speed_worker(item, speed_bytes, sem):
     ip = item["ip"]
+    port = str(item.get("port") or "443")
     latency, loss = ping_stats(ip)
     if latency is None:
         return ip, None, "DROP: ping无有效ms响应"
@@ -872,7 +902,7 @@ def speed_worker(item, speed_bytes, sem):
     if latency > MAX_LATENCY_MS:
         return ip, None, f"DROP: latency {latency:.1f}ms > {MAX_LATENCY_MS:.0f}ms"
     with sem:
-        speed = speed_test(ip, speed_bytes)
+        speed = speed_test(ip, speed_bytes, port)
     if speed is None:
         return ip, None, "DROP: speed test失败"
     if speed < MIN_SPEED_MBPS:
@@ -1177,10 +1207,10 @@ def outputs(results, outtxt, outcsv, only_best):
 
     with open(outcsv, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["rank", "ip", "score", "latency", "loss",
+        w.writerow(["rank", "ip", "port", "score", "latency", "loss",
                     "speed", "cfcountry", "route", "tour", "country", "city"])
         for i, r in enumerate(results, 1):
-            w.writerow([i, r["ip"], f"{ip_score(r):.1f}",
+            w.writerow([i, r["ip"], r.get("port", "443"), f"{ip_score(r):.1f}",
                         fmt_latency(r["latency"]), fmt_loss(r.get("loss")),
                         fmt_speed(r["speed"]), r.get("cfcountry", ""),
                         r.get("route", ""), r.get("tour", "None"),
@@ -1199,7 +1229,10 @@ def outputs(results, outtxt, outcsv, only_best):
         rank += 1
         tour = r.get("tour", "None")
         rd = route if tour == "None" else f"{route}绕" + "、".join(flag(c) for c in tour.split("→"))
-        line = f"{r['ip']}#{flag(r.get('country', ''))} ({rd})"
+        # 非 443 端口要标出来，否则下游按 443 去连会连不上
+        port = str(r.get("port") or "443")
+        addr = r["ip"] if port == "443" else f"{r['ip']}:{port}"
+        line = f"{addr}#{flag(r.get('country', ''))} ({rd})"
         city = (r.get("city") or "").strip()
         if city:
             line += f" {city}"

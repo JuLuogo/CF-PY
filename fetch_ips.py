@@ -249,6 +249,7 @@ def apply_config(cfg):
     global IPDB_API_BASE, IPDB_TYPES, IPDB_COUNTRY, IPDB_TIMEOUT, IPDB_RETRIES, IPDB_MAX
     global IPDB_CF_SAMPLE, LIST_URLS, LIST_TIMEOUT, LIST_REGIONS
     global ASNS, ASN_SAMPLE, ASN_REGIONS, ASN_EXCLUDE_REGIONS
+    global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
 
     get = cfg.get
     if "FOFA_API_BASE" in cfg:        FOFA_API_BASE = str(get("FOFA_API_BASE")).strip() or FOFA_API_BASE
@@ -287,6 +288,12 @@ def apply_config(cfg):
     if "ASN_SAMPLE" in cfg:           ASN_SAMPLE = as_int(get("ASN_SAMPLE"), ASN_SAMPLE)
     if "ASN_REGIONS" in cfg:          ASN_REGIONS = str(get("ASN_REGIONS") or "").strip()
     if "ASN_EXCLUDE_REGIONS" in cfg:  ASN_EXCLUDE_REGIONS = str(get("ASN_EXCLUDE_REGIONS") or "").strip()
+    if "NOTIFY_CHANNEL" in cfg:       NOTIFY_CHANNEL = str(get("NOTIFY_CHANNEL") or "").strip()
+    if "NOTIFY_TARGET" in cfg:        NOTIFY_TARGET = str(get("NOTIFY_TARGET") or "").strip()
+    if "NOTIFY_TIMEOUT" in cfg:       NOTIFY_TIMEOUT = as_int(get("NOTIFY_TIMEOUT"), NOTIFY_TIMEOUT)
+    if "NOTIFY_ONLY_WITH_RESULT" in cfg:
+        NOTIFY_ONLY_WITH_RESULT = as_bool(get("NOTIFY_ONLY_WITH_RESULT"), NOTIFY_ONLY_WITH_RESULT)
+    if "PORTS" in cfg:                PORTS = str(get("PORTS") or "").strip()
 
 
 def apply_env():
@@ -296,6 +303,7 @@ def apply_env():
     """
     global FOFA_EMAIL, FOFA_KEY, FOFA_REGIONS
     global ASNS, ASN_SAMPLE, ASN_REGIONS, ASN_EXCLUDE_REGIONS
+    global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
     global LIST_URLS, LIST_REGIONS, IPDB_TYPES, IPDB_CF_SAMPLE
 
     env = os.environ.get
@@ -867,6 +875,20 @@ ASNS = ""                # 例："alibaba,vultr" 或 "AS45102,AS20473"
 ASN_SAMPLE = 100         # 采样多少个 /24（每个 /24 一个 IP）
 ASN_MAX_SUBNETS = 200000  # 安全阀：单个 ASN 展开超过这个数就只取前 N 个再采样
 
+# ==================== 推送通知（每轮结束推到手机） ====================
+# 渠道见 notify.py：bark / pushdeer / ntfy / serverchan / telegram /
+#                  wecom / dingtalk / feishu / webhook
+NOTIFY_CHANNEL = ""            # 例 "bark"
+NOTIFY_TARGET = ""             # 各渠道的 key / webhook 地址
+NOTIFY_TIMEOUT = 15
+NOTIFY_ONLY_WITH_RESULT = True  # 没有可用 IP 时不推送（免得白刷屏）
+
+# 测哪些端口。CF 支持的 HTTPS 端口是这 6 个：
+#   443 / 2053 / 2083 / 2087 / 2096 / 8443
+# 只测 443 会丢掉近一半的反代（公开列表里 443 只占 57%，其余都在这些端口上）。
+# 留空字符串表示不限制（列表源里是什么端口就测什么）。
+PORTS = "443"
+
 def asn_prefixes(asn, timeout, retries, debug=False):
     """查一个 ASN 宣告的 IPv4 网段，返回 ipaddress 网络对象列表。"""
     asn = str(asn).strip().upper()
@@ -938,11 +960,10 @@ def asn_fetch(asns, sample, timeout, retries, debug=False):
     rows = []
     for n in picks:
         if n.num_addresses >= 2:
-            rows.append({"ip": str(n.network_address + random.randint(1, n.num_addresses - 1)),
-                         "port": "443", "protocol": "https", "country": ""})
+            addr = str(n.network_address + random.randint(1, n.num_addresses - 1))
         else:
-            rows.append({"ip": str(n.network_address), "port": "443",
-                         "protocol": "https", "country": ""})
+            addr = str(n.network_address)
+        rows.append({"ip": addr, "port": "443", "protocol": "https", "country": ""})
     log(f"    [ASN] 从 {len(nets24):,} 个 /24 中取出 {len(rows):,} 个地址")
     return rows, stats
 
@@ -1123,11 +1144,11 @@ def read_fofa_export_text(content):
     return rows
 
 
-def normalize(rows, require_port, exclude_nets, skip_ips, exclude_asns=None, limit=0):
+def normalize(rows, require_ports, exclude_nets, skip_ips, exclude_asns=None, limit=0):
     """去重 + 剔除私网/保留地址 + 端口过滤 + 网段/ASN 排除，返回 (kept, stats)。
 
-    limit > 0 时截断到该数量：标记为 _priority 的（IPDB bestproxy 优选名单）优先保留，
-    其余随机取样——这样定时循环时不会每轮都测同一批 IP。
+    require_ports 是允许的端口集合（空集合 = 不限制）。
+    limit > 0 时截断到该数量：标记为 _rank 的优先保留，其余随机取样。
     """
     stats = {"total": len(rows), "bad_ip": 0, "not_public": 0, "port": 0,
              "excluded": 0, "asn": 0, "skipped": 0, "dup": 0, "truncated": 0}
@@ -1150,9 +1171,9 @@ def normalize(rows, require_port, exclude_nets, skip_ips, exclude_asns=None, lim
                 or obj.is_reserved or obj.is_unspecified):
             stats["not_public"] += 1
             continue
-        # 端口未知（例如网页版导出没带 port 列）时不参与过滤，交给 ip.py 实测
-        port_val = str(r.get("port", "")).strip()
-        if require_port and port_val and port_val != require_port:
+        # 端口未知（例如网页版导出没带 port 列）时按 443 处理
+        port_val = str(r.get("port", "")).strip() or "443"
+        if require_ports and port_val not in require_ports:
             stats["port"] += 1
             continue
         # 本地再兜一层 Cloudflare 自家 ASN 过滤：网页版导出没有 API 查询的 asn!= 条件
@@ -1166,12 +1187,15 @@ def normalize(rows, require_port, exclude_nets, skip_ips, exclude_asns=None, lim
         if ip in skip_ips:
             stats["skipped"] += 1
             continue
-        if ip in seen:
+        # 去重键是 ip:port —— 同一个 IP 的不同端口是两个不同的反代入口，
+        # 只按 IP 去重会把 8443 上的可用反代当成 443 的重复项丢掉
+        dedup_key = f"{ip}:{port_val}"
+        if dedup_key in seen:
             stats["dup"] += 1
             continue
-        seen.add(ip)
+        seen.add(dedup_key)
 
-        port = str(r.get("port", "")).strip() or "443"
+        port = port_val
         row = {
             "ip": ip,
             "port": port,
@@ -1327,6 +1351,11 @@ def env_report():
 
 
 def run_tester(csv_path, extra_args):
+    """调用 ip.py 实测。返回 (退出码, 可用数, 优质数)。
+
+    顺便把 ip.py 的输出逐行透传（保持实时可见），并从里面抠出
+    「第一阶段完成：N/M」「第二阶段完成：N/M」这两个数字，给推送用。
+    """
     proxy = detect_proxy()          # 环境变量代理：curl 真的会走
     sysproxy = detect_sysproxy()    # 注册表代理：curl 不读，仅提示
     tuns = detect_tun()
@@ -1351,11 +1380,66 @@ def run_tester(csv_path, extra_args):
 
     cmd = [sys.executable, os.path.join(HERE, "ip.py"), "-i", csv_path] + list(extra_args)
     log(f"\n[*] 调用测试脚本：{' '.join(cmd)}\n")
+
+    avail = qual = None
     try:
-        return subprocess.call(cmd, cwd=HERE)
+        p = subprocess.Popen(cmd, cwd=HERE, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True,
+                             encoding="utf-8", errors="replace", bufsize=1)
     except OSError as e:
         log(f"[!] 调用 ip.py 失败：{e}")
-        return 1
+        return 1, None, None
+
+    for line in p.stdout:
+        print(line.rstrip("\n"), flush=True)
+        m = re.search(r"第一阶段完成：(\d+)/(\d+)", line)
+        if m:
+            avail = (int(m.group(1)), int(m.group(2)))
+        m = re.search(r"第二阶段完成：(\d+)/(\d+)", line)
+        if m:
+            qual = (int(m.group(1)), int(m.group(2)))
+    p.wait()
+    return p.returncode, avail, qual
+
+
+def send_notification(round_no, avail, qual, loop_secs=0):
+    """一轮结束后推送结果到手机。没配置渠道就静默跳过。"""
+    ch = (NOTIFY_CHANNEL or "").strip()
+    tgt = (NOTIFY_TARGET or "").strip()
+    if not ch or not tgt:
+        return
+    try:
+        import notify as _n
+        _n.NOTIFY_CHANNEL = ch
+        _n.NOTIFY_TARGET = tgt
+        _n.NOTIFY_TIMEOUT = NOTIFY_TIMEOUT
+
+        summary = read_final_summary(limit=200)
+        rows = summary.get("rows") or []
+        if NOTIFY_ONLY_WITH_RESULT and not rows:
+            log("[*] 本轮没有可用 IP，按配置跳过推送")
+            return
+
+        n_avail = avail[0] if avail else None
+        n_total = avail[1] if avail else None
+        n_qual = qual[0] if qual else len(rows)
+
+        head = f"第 {round_no} 轮完成" if round_no else "扫描完成"
+        lines = [head + f" · {datetime.now():%m-%d %H:%M}"]
+        if n_total is not None:
+            lines.append(f"候选 {n_total} → 反代可用 {n_avail} → 优质 {n_qual}")
+        else:
+            lines.append(f"优质 {n_qual}")
+        lines.append("")
+
+        body = _n.build_summary(
+            round_no=None, available=n_avail, quality=n_qual, rows=rows)
+        text = "\n".join(lines) + body
+
+        ok, msg = _n.send(f"CF 反代 IP · {head}", text)
+        log(f"[*] 推送{'成功' if ok else '失败'}（{ch}）：{msg}")
+    except Exception as e:                       # noqa: BLE001
+        log(f"[!] 推送出错（不影响扫描）：{e}")
 
 
 # ==================== 磁盘占用控制（1GB 小硬盘 VPS 必需） ====================
@@ -1685,6 +1769,20 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
         if not raw_rows:
             log("[!] 没有采到任何地址。")
             return 4
+        # 多端口：同一个地址在每个允许的端口上都测一遍。
+        # CF 支持的 HTTPS 端口有 6 个，只测 443 会丢掉近一半的反代。
+        asn_ports = as_list(PORTS) or ["443"]
+        if len(asn_ports) > 1:
+            before = len(raw_rows)
+            expanded = []
+            for r in raw_rows:
+                for p in asn_ports:
+                    rr = dict(r)
+                    rr["port"] = p
+                    expanded.append(rr)
+            raw_rows = expanded
+            log(f"[*] 多端口展开 {','.join(asn_ports)}："
+                f"{before} 个地址 -> {len(raw_rows)} 个探测点")
         want_asn = {r.upper() for r in as_list(ASN_REGIONS)}
         drop_asn = {r.upper() for r in as_list(ASN_EXCLUDE_REGIONS)}
         if (want_asn or drop_asn) and len(raw_rows) > GEO_MAX:
@@ -1750,7 +1848,9 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
     if skip_ips:
         log(f"[*] 已从 {FOFA_SKIP_FILE} 载入 {len(skip_ips)} 个 IP 用于去重跳过")
 
-    rows, stats = normalize(raw_rows, FOFA_REQUIRE_PORT, exclude_nets,
+    # 允许的端口集合：PORTS 为空则不限制（列表源里是什么端口就测什么）
+    want_ports = {p.strip() for p in as_list(PORTS)} if PORTS.strip() else set()
+    rows, stats = normalize(raw_rows, want_ports, exclude_nets,
                             skip_ips, exclude_asns, limit=a.max or 0)
 
     log("")
@@ -1781,9 +1881,9 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
                  csv=csv_path)
 
     if a.run or FOFA_RUN:
-        rc = run_tester(csv_path, extra_run_args)
-        # 测试结束后把最终结果摘出来给 Web UI
+        rc, avail, qual = run_tester(csv_path, extra_run_args)
         write_status(phase="done", test_rc=rc, final=read_final_summary())
+        send_notification(round_no, avail, qual, loop_secs)
         return rc
 
     log("")
@@ -1797,7 +1897,7 @@ def main():
     global FOFA_KEY, FOFA_EMAIL, FOFA_REGIONS, FOFA_CSV_OUTPUT, FOFA_PRESET
     global FOFA_QUERY_TEMPLATE, FOFA_MAX_PER_REGION, FOFA_FIELDS, DEBUG, IPDB_TYPES
     global IPDB_CF_SAMPLE, LIST_URLS, LIST_REGIONS, ASNS, ASN_SAMPLE, ASN_REGIONS
-    global ASN_EXCLUDE_REGIONS
+    global ASN_EXCLUDE_REGIONS, NOTIFY_CHANNEL, NOTIFY_TARGET, PORTS
 
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("-config", default=None)
@@ -1825,6 +1925,10 @@ def main():
                    help=f"ASN 采样后只保留这些地区（白名单），默认 '{ASN_REGIONS}'（空=不启用）")
     p.add_argument("-asn-exclude-regions", default=None,
                    help=f"ASN 采样后排除这些地区（黑名单），默认 '{ASN_EXCLUDE_REGIONS}'")
+    p.add_argument("-ports", default=None,
+                   help=f"测哪些端口，逗号分隔。CF 的 HTTPS 端口是 "
+                        f"443,2053,2083,2087,2096,8443。默认 '{PORTS}'，空=不限制。"
+                        f"注意是乘法：6 个端口 = 探测点数 ×6")
     p.add_argument("-list-urls", default=None,
                    help=f"第三方列表源：{', '.join(sorted(LIST_SOURCES))}，或完整 URL，逗号分隔")
     p.add_argument("-list-regions", default=None,
@@ -1901,6 +2005,8 @@ def main():
         ASN_REGIONS = a.asn_regions.strip()
     if a.asn_exclude_regions is not None:
         ASN_EXCLUDE_REGIONS = a.asn_exclude_regions.strip()
+    if a.ports is not None:
+        PORTS = a.ports.strip()
     if a.cf_sample is not None:
         IPDB_CF_SAMPLE = max(0, a.cf_sample)
         if IPDB_CF_SAMPLE > 200:
