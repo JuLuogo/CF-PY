@@ -247,9 +247,10 @@ PYEOF
 
 # 环境文件（给 systemd / docker 读）
 cat > "$INSTALL_DIR/cfip.env" <<EOF
-ASNS=${ASNS}
-ASN_SAMPLE=${SAMPLE}
-ASN_EXCLUDE_REGIONS=CN
+# 注意：这里【不要】放 ASNS / ASN_SAMPLE 之类的扫描参数。
+# 环境变量优先级高于 config.ini，放这里会让 Web 面板改 config.ini 不生效
+# （实测踩过：面板上把档位改成 niche，服务还在按 cfip.env 里的 vps 跑）。
+# 扫描参数一律以 config.ini 为准。
 PYTHONUNBUFFERED=1
 PYTHONUTF8=1
 TZ=Asia/Shanghai
