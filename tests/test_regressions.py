@@ -399,6 +399,46 @@ def test_two_datasets():
     check("ip.py 有地区白名单", "OUTPUT_REGIONS" in ip_src)
 
 
+
+
+# ---------------------------------------------------------------- 12. 进度条前后端一致
+def test_progress_keys():
+    """面板上只显示一个进度条 —— 因为前端的 STAGE_ORDER 漏了 s0，
+    而且没开始的阶段根本不渲染。这里把「后端会上报的 key」
+    和「前端会渲染的 key」对齐关系固化下来。
+    """
+    import re
+    w = open(os.path.join(ROOT, "webui.py"), encoding="utf-8").read()
+    f = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    i = open(os.path.join(ROOT, "ip.py"), encoding="utf-8").read()
+
+    m = re.search(r"STAGE_ORDER\s*=\s*\[([^\]]*)\]", w)
+    check("webui 有 STAGE_ORDER", bool(m))
+    if not m:
+        return
+    order = set(re.findall(r"'([^']+)'", m.group(1)))
+
+    # 后端会上报的 key：
+    #   fetch_ips 直接 set_progress("xxx", ...)
+    #   ip.py 用 progress("stage-name", ...)，在 run_tester 里映射成 s0/s1/s2/s3
+    direct = set(re.findall(r'set_progress\("([a-z0-9]+)"', f))
+    mapped = set(re.findall(r'"([a-z/]+)":\s*\("([a-z0-9]+)"', f))
+    mapped_keys = {v for _k, v in mapped}
+    reported = direct | mapped_keys
+    # stage0 在 ip.py 里是 progress("s0", ...) 直接写的
+    if 'progress("s0"' in i:
+        reported.add("s0")
+
+    missing = sorted(reported - order)
+    check("前端 STAGE_ORDER 覆盖了后端所有进度 key", not missing,
+          f"后端上报但前端不渲染: {missing}")
+    check("stage0 在前端顺序里", "s0" in order, f"STAGE_ORDER={sorted(order)}")
+
+    # 没开始的阶段也要渲染出来（否则只看到一条）
+    check("未开始的阶段会渲染占位", "未开始" in w)
+    check("当前任务有高亮", "当前任务" in w)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  回归测试")
@@ -406,7 +446,7 @@ if __name__ == "__main__":
     for fn in (test_globals_declared, test_full_scan, test_cleanup,
                test_multiport, test_notify_summary, test_files_ok, test_webui,
                test_undefined_globals, test_streaming_sampling,
-               test_once_semantics, test_two_datasets):
+               test_once_semantics, test_two_datasets, test_progress_keys):
         print(f"\n[{fn.__name__}] {fn.__doc__.splitlines()[0] if fn.__doc__ else ''}")
         try:
             fn()

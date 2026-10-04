@@ -709,10 +709,14 @@ const q = TOKEN ? ('?token=' + encodeURIComponent(TOKEN)) : '';
 async function api(p, opt){ const r = await fetch(p + q, opt); return r.json(); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
-const STAGE_ORDER = ['asn', 'geo', 's1', 's2', 's3'];
+// 整条流水线的顺序。全部都会渲染出来（没开始的显示 0%），
+// 这样一眼能看到「现在在哪一步、后面还有几步」。
+const STAGE_ORDER = ['asn', 'geo', 's0', 's1', 's2', 's3'];
 const STAGE_SHORT = {
-  asn: '抓取 ASN 网段', geo: '地区标注',
-  s1: '第一阶段 · 可用性', s2: '第二阶段 · 测速', s3: '第三阶段 · 线路'
+  asn: '抓取 · 查询 ASN 宣告网段', geo: '抓取 · 地区标注',
+  s0: 'stage0 · TCP 预筛',
+  s1: 'stage1 · 可用性检查（确认是不是真反代）',
+  s2: 'stage2 · 延迟与测速', s3: 'stage3 · 线路分析'
 };
 
 function progBarHtml(k, p){
@@ -743,25 +747,68 @@ function progBarHtml(k, p){
 function renderProgress(st){
   const prog = st.progress || {};
   const wrap = document.getElementById('progwrap');
-  const keys = STAGE_ORDER.filter(k => prog[k]);
-  if (!keys.length) {
-    wrap.innerHTML = '<div class="hint">还没有进度信息（等扫描跑起来）</div>';
-    return;
-  }
-  // 当前任务：取第一个未完成的阶段
+  // 当前任务 = 第一个还没跑完的阶段
   let curTask = null;
-  for (const k of keys) { if ((prog[k].pct || 0) < 100) { curTask = k; break; } }
-  if (!curTask) curTask = keys[keys.length - 1];
-  const cp = prog[curTask];
-  let head = '<div class="row" style="margin:0 0 12px">'
+  for (const k of STAGE_ORDER) {
+    if (prog[k] && (prog[k].pct == null || prog[k].pct < 100)) { curTask = k; break; }
+  }
+  if (!curTask) {
+    // 都跑完了，或者都还没开始 -> 取最后一个有数据的
+    for (let i = STAGE_ORDER.length - 1; i >= 0; i--) {
+      if (prog[STAGE_ORDER[i]]) { curTask = STAGE_ORDER[i]; break; }
+    }
+  }
+  if (!curTask) curTask = 'asn';
+
+  // 顶部：当前任务
+  const cp = prog[curTask] || {};
+  let head = '<div class="row" style="margin:0 0 14px">'
     + '<span class="pill on">当前任务</span>'
-    + '<b style="font-size:15px">' + esc(cp.name || STAGE_SHORT[curTask]) + '</b>'
+    + '<b style="font-size:15px">' + esc(cp.name || STAGE_SHORT[curTask] || curTask) + '</b>'
     + '<span class="k" style="margin:0">第 ' + (st.round || 0) + ' 轮</span>';
   if (cp.ip) head += '<span class="k" style="margin:0">' + esc(cp.ip)
     + (cp.cidr ? '（' + esc(cp.cidr) + '）' : '') + '</span>';
   else if (cp.current) head += '<span class="k" style="margin:0">' + esc(cp.current) + '</span>';
   head += '</div>';
-  wrap.innerHTML = head + keys.map(k => progBarHtml(k, prog[k])).join('');
+
+  // 下面：整条流水线，每步一条。没开始的显示 0%（灰）。
+  const bars = STAGE_ORDER.map(function(k){
+    const p = prog[k];
+    const isCur = (k === curTask);
+    if (!p) {
+      return '<div style="margin-bottom:12px;opacity:.45">'
+        + '<div class="row" style="margin:0 0 4px;justify-content:space-between">'
+        +   '<span>' + esc(STAGE_SHORT[k] || k) + ' <span class="k">未开始</span></span>'
+        +   '<span class="k" style="margin:0">—</span>'
+        + '</div>'
+        + '<div class="bar"><i style="width:0"></i></div>'
+        + '</div>';
+    }
+    const pct = (p.pct != null) ? p.pct : 0;
+    const done = (p.done != null) ? p.done : 0;
+    const total = p.total || 0;
+    let cur = '';
+    if (p.ip) {
+      cur = '正在测 <b>' + esc(p.ip) + '</b>';
+      if (p.cidr) cur += '　网段 <b>' + esc(p.cidr) + '</b>';
+      if (p.port && p.port !== '443') cur += '　端口 <b>' + esc(p.port) + '</b>';
+    } else if (p.current) {
+      cur = '正在处理 <b>' + esc(p.current) + '</b>';
+    }
+    return '<div style="margin-bottom:12px' + (isCur ? '' : ';opacity:.75') + '">'
+      + '<div class="row" style="margin:0 0 4px;justify-content:space-between">'
+      +   '<span>' + (isCur ? '<b>' : '') + esc(p.name || STAGE_SHORT[k] || k)
+      +     (isCur ? '</b>' : '')
+      +     (pct >= 100 ? ' <span class="pill on">完成</span>' : '') + '</span>'
+      +   '<span class="k" style="margin:0">' + done.toLocaleString()
+      +     ' / ' + total.toLocaleString() + '　' + pct.toFixed(1) + '%</span>'
+      + '</div>'
+      + '<div class="bar"><i style="width:' + pct + '%"></i></div>'
+      + (cur ? '<div class="hint" style="margin-top:5px">' + cur + '</div>' : '')
+      + '</div>';
+  }).join('');
+
+  wrap.innerHTML = head + bars;
 }
 
 function renderTable(tbodyId, countId, rows, emptyMsg){
