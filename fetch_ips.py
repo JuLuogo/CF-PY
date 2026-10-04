@@ -261,6 +261,7 @@ def apply_config(cfg):
     global ASNS, ASN_SAMPLE, ASN_REGIONS, ASN_EXCLUDE_REGIONS
     global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
     global THREADS, LOOP
+    global OUTPUT_REGIONS, OUTPUT_SPLIT
 
     get = cfg.get
     if "FOFA_API_BASE" in cfg:        FOFA_API_BASE = str(get("FOFA_API_BASE")).strip() or FOFA_API_BASE
@@ -305,6 +306,9 @@ def apply_config(cfg):
     if "NOTIFY_ONLY_WITH_RESULT" in cfg:
         NOTIFY_ONLY_WITH_RESULT = as_bool(get("NOTIFY_ONLY_WITH_RESULT"), NOTIFY_ONLY_WITH_RESULT)
     if "PORTS" in cfg:                PORTS = str(get("PORTS") or "").strip()
+    if "OUTPUT_REGIONS" in cfg:
+        OUTPUT_REGIONS = str(get("OUTPUT_REGIONS") or "").strip().strip('"')
+    if "OUTPUT_SPLIT" in cfg:         OUTPUT_SPLIT = as_bool(get("OUTPUT_SPLIT"), OUTPUT_SPLIT)
     if "THREADS" in cfg:              THREADS = as_int(get("THREADS"), THREADS)
     if "LOOP" in cfg:                 LOOP = as_int(get("LOOP"), LOOP)
 
@@ -903,6 +907,12 @@ NOTIFY_ONLY_WITH_RESULT = True  # 没有可用 IP 时不推送（免得白刷屏
 # 留空字符串表示不限制（列表源里是什么端口就测什么）。
 PORTS = "443"
 
+# 两套输出的地区白名单。ip.py 用它决定第二套列表写哪些地区；
+# fetch_ips.py 用它算出地区版文件名后缀，好在读结果时把地区版 CSV 排除掉
+# （不排除的话，地区版是后写的、mtime 更新，会被当成主结果读出来）。
+OUTPUT_REGIONS = "HK,JP,SG,KR,TW"
+OUTPUT_SPLIT = True
+
 # 扫描线程数与循环间隔也放进配置，这样 Web 面板能直接控制，
 # 不用去改 systemd unit 文件。
 THREADS = 20
@@ -1257,6 +1267,25 @@ def normalize(rows, require_ports, exclude_nets, skip_ips, exclude_asns=None, li
 
 
 CSV_HEADER = ["ip", "port", "protocol", "title", "domain", "country", "city", "link", "org"]
+
+
+def open_csv_writer(path):
+    """打开一个增量写 CSV 的 writer（调用方负责 close）。"""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    f = open(path, "w", encoding="utf-8-sig", newline="")
+    w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+    w.writeheader()
+    return f, w
+
+
+def merge_stats(dst, src):
+    """把一批的统计累加进总统计。"""
+    for k, v in (src or {}).items():
+        if isinstance(v, int):
+            dst[k] = dst.get(k, 0) + v
+    return dst
 
 
 def write_csv(path, rows):
@@ -1781,21 +1810,29 @@ def read_final_summary(limit=200):
             except OSError:
                 pass
 
-    # 最新的 bestips-*.csv
+    # 最新的 bestips-*.csv（**主 CSV**）
+    # 注意要排除地区版 bestips-*-<tag>.csv —— 它是后写的、mtime 更新，
+    # 不排除的话会被当成主结果读出来，导致「全量」列表只剩地区那几个。
+    region_tag = "".join(sorted(
+        x.strip().upper() for x in re.split(r"[,;\s]+", OUTPUT_REGIONS) if x.strip()
+    )).lower()
     newest, newest_mtime = None, 0.0
     for root in (outdir, HERE):
         if not os.path.isdir(root):
             continue
         for dirpath, _dirs, files in os.walk(root):
             for fn in files:
-                if fn.startswith("bestips") and fn.endswith(".csv"):
-                    p = os.path.join(dirpath, fn)
-                    try:
-                        mt = os.path.getmtime(p)
-                    except OSError:
-                        continue
-                    if mt > newest_mtime:
-                        newest, newest_mtime = p, mt
+                if not (fn.startswith("bestips") and fn.endswith(".csv")):
+                    continue
+                if region_tag and fn.endswith(f"-{region_tag}.csv"):
+                    continue                     # 地区版，跳过
+                p = os.path.join(dirpath, fn)
+                try:
+                    mt = os.path.getmtime(p)
+                except OSError:
+                    continue
+                if mt > newest_mtime:
+                    newest, newest_mtime = p, mt
     if newest:
         out["csv_file"] = newest
         try:
@@ -1804,6 +1841,161 @@ def read_final_summary(limit=200):
         except (OSError, csv.Error):
             pass
     return out
+
+
+# ==================== 流式抓取（省内存）====================
+# 原来的做法：把 69 个 ASN 的所有 /24 全部展开成一个列表（18 万个
+# IPv4Network 对象，约 35MB），再采样、再建 18 万个 dict（约 42MB），
+# normalize 之后又复制一份（约 34MB）—— 峰值 110MB+，实测 fetch_ips.py
+# 常驻 176MB。1 核 726MB 的机器上这个量级很不健康。
+#
+# 流式做法：
+#   1. 数 /24 个数用 O(网段数) 而不是 O(/24 数) —— 一个 /20 直接算成 16 个，
+#      不展开。阿里云 1145 个网段 -> 12 万 /24，数一遍只要 1145 次循环。
+#   2. 逐个 ASN 处理：查网段 -> 按比例采样 -> 立刻过滤 -> 直接写 CSV，
+#      处理完就释放。峰值内存只跟【单个 ASN 的网段数】有关（最大约 1145 个）。
+#   3. 全程不持有完整候选列表。
+
+
+def count_24s(nets):
+    """数一段网段里有多少个 /24。O(网段数)，不展开。
+
+    /20 算 16 个，/25 及更小的算 1 个（它们本身就在同一个 /24 里）。
+    """
+    total = 0
+    for n in nets:
+        pl = n.prefixlen
+        total += (1 << (24 - pl)) if pl <= 24 else 1
+    return total
+
+
+def sample_24s(nets, k, weights=None, total=None):
+    """从网段列表里随机取 k 个 /24 的首地址（int）。不展开成 /24 对象。
+
+    按每个网段含多少个 /24 加权，所以大网段被选中的概率天然更高，
+    和「先展开成 /24 列表再随机抽」是同一个分布。
+
+    **无放回**：同一个 /24 不会返回两次。有放回的话会浪费扫描名额
+    （重复的地址会在后面的去重里被丢掉，等于少扫了几个）。
+    """
+    if not nets or k <= 0:
+        return []
+    if weights is None:
+        weights = [(1 << (24 - n.prefixlen)) if n.prefixlen <= 24 else 1 for n in nets]
+    if total is None:
+        total = sum(weights)
+    if total <= 0:
+        return []
+
+    # 累积权重 + 二分查找：每个样本 O(log n) 而不是 O(n)
+    import bisect
+    cum = []
+    acc = 0
+    for w in weights:
+        acc += w
+        cum.append(acc)
+
+    k = min(k, total)          # 不可能取到比总数还多
+    out, seen = [], set()
+    # 取满 k 个就停；重复太多次（k 接近 total 时）就退出，避免空转
+    guard = 0
+    limit = max(k * 30, 1000)
+    while len(out) < k and guard < limit:
+        guard += 1
+        r = random.randrange(total)
+        i = bisect.bisect_right(cum, r)
+        if i >= len(nets):
+            i = len(nets) - 1
+        # 在这个网段里选第 (r - 前面累计) 个 /24
+        base_off = (cum[i - 1] if i > 0 else 0)
+        idx = r - base_off
+        base = int(nets[i].network_address) + idx * 256
+        if base in seen:
+            continue
+        seen.add(base)
+        out.append(base)
+    return out
+
+
+def iter_asn_candidates(asns, sample, timeout, retries, debug=False, stats=None):
+    """逐个 ASN 产出候选 dict，边产边释放。峰值内存只跟单个 ASN 的网段数有关。
+
+    sample=0 表示全量（所有 /24 都产出）。
+
+    为什么要先缓存网段再采样：
+      按占比分配采样名额需要先知道每个 ASN 有多少 /24，这就得先查一遍网段；
+      但网段列表不能常驻内存（18 万个 /24 展开后约 35MB）。
+      所以第一遍把网段【写成文本存到临时文件】（约 1~2MB），第二遍读回来采样。
+      这样 ASN API 还是只查一遍，内存也不会涨。
+    """
+    import ipaddress
+    import tempfile
+
+    counts = {}
+    cache = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".nets",
+                                        delete=False, prefix="cfip-nets-")
+    cache_path = cache.name
+    try:
+        # ---- 第一遍：查网段 -> 只留数量 + 写临时文件 ----
+        for idx, asn in enumerate(asns, 1):
+            set_progress("asn", "抓取 · 查询 ASN 宣告网段", idx, len(asns), current=asn)
+            try:
+                nets = asn_prefixes(asn, timeout, retries, debug)
+            except Exception as e:               # noqa: BLE001
+                log(f"    [ASN {asn}] 查询失败：{e}")
+                counts[asn] = 0
+                continue
+            n24 = count_24s(nets)
+            counts[asn] = n24
+            # 存成 "asn<TAB>net1,net2,..." 一行，读回来是 O(网段数)
+            cache.write(asn + "\t" + ",".join(str(n) for n in nets) + "\n")
+            log(f"    [ASN {asn}] 网段 {len(nets)} 个 -> /24 {n24:,} 个")
+            del nets
+        cache.close()
+
+        grand = sum(counts.values())
+        if grand <= 0:
+            return
+        log(f"[*] 共 {grand:,} 个 /24，开始流式采样"
+            + ("（全量模式，不采样）" if not sample else f"（目标 {sample} 个）"))
+
+        # ---- 第二遍：从临时文件读回网段，采样后立即产出 ----
+        picked_total = 0
+        with open(cache_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                asn, _, netstr = line.rstrip("\n").partition("\t")
+                n24 = counts.get(asn, 0)
+                if n24 <= 0 or not netstr:
+                    continue
+                nets = [ipaddress.ip_network(x) for x in netstr.split(",") if x]
+                if sample and sample > 0:
+                    # 按占比分配名额；至少给 1 个，免得小 ASN 永远抽不到
+                    k = max(1, round(sample * n24 / grand))
+                    k = min(k, n24)
+                    addrs = sample_24s(nets, k)
+                else:
+                    addrs = []
+                    for n in nets:
+                        if n.prefixlen <= 24:
+                            step = 1 << (24 - n.prefixlen)
+                            base = int(n.network_address)
+                            addrs.extend(base + i * 256 for i in range(step))
+                        else:
+                            addrs.append(int(n.network_address))
+                del nets
+                for base in addrs:
+                    picked_total += 1
+                    yield {"ip": str(ipaddress.IPv4Address(base + random.randint(1, 254))),
+                           "port": "443", "protocol": "https", "country": ""}
+                del addrs
+        log(f"[*] 采样完成，共 {picked_total:,} 个候选地址")
+        if stats is not None:
+            stats["asns"] = len([a for a, c in counts.items() if c > 0])
+    finally:
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
 
 
 # ==================== 单轮流水线 ====================
@@ -1928,57 +2120,70 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
             log("[!] -source asn 需要指定 -asns（名字或 AS 号）。可用名字：")
             log(f"    {', '.join(sorted(ASN_GROUPS))}")
             return 5
-        log(f"[*] 查询 {len(asns)} 个 ASN 的宣告网段，共采样 {ASN_SAMPLE} 个 /24")
-        raw_rows, astat = asn_fetch(asns, ASN_SAMPLE, FOFA_TIMEOUT, FOFA_RETRIES, DEBUG)
-        if not raw_rows:
-            log("[!] 没有采到任何地址。")
-            return 4
-        # 多端口：同一个地址在每个允许的端口上都测一遍。
-        # CF 支持的 HTTPS 端口有 6 个，只测 443 会丢掉近一半的反代。
-        asn_ports = as_list(PORTS) or ["443"]
-        if len(asn_ports) > 1:
-            before = len(raw_rows)
-            expanded = []
-            for r in raw_rows:
-                for p in asn_ports:
-                    rr = dict(r)
-                    rr["port"] = p
-                    expanded.append(rr)
-            raw_rows = expanded
-            log(f"[*] 多端口展开 {','.join(asn_ports)}："
-                f"{before} 个地址 -> {len(raw_rows)} 个探测点")
+        log(f"[*] 查询 {len(asns)} 个 ASN 的宣告网段，"
+            f"{'全量（不采样）' if not ASN_SAMPLE else f'共采样 {ASN_SAMPLE} 个 /24'}")
+
+        # ---- 流式：边采样 -> 边过滤 -> 增量写 CSV ----
+        # 不这么做的话，18 万个候选会先在内存里堆成一个大列表，
+        # 再被 normalize 复制一份，峰值 110MB+（实测 fetch_ips.py 常驻 176MB）。
+        # 分批处理后峰值只跟批大小有关。
         want_asn = {r.upper() for r in as_list(ASN_REGIONS)}
         drop_asn = {r.upper() for r in as_list(ASN_EXCLUDE_REGIONS)}
-        if (want_asn or drop_asn) and len(raw_rows) > GEO_MAX:
-            log(f"[!] 采到 {len(raw_rows):,} 个地址，超过地区批量查询上限 {GEO_MAX:,}，跳过地区预筛。")
-            log("    （免费接口 15 请求/分钟，几万个 IP 要跑几十分钟，不划算）")
-            log("    大陆 IP 已由 ASN 层面的 _cn 分组排除，其余交给 ip.py 自己判断地区。")
-        elif want_asn or drop_asn:
-            desc = []
-            if drop_asn:
-                desc.append("排除 " + ",".join(sorted(drop_asn)))
-            if want_asn:
-                desc.append("只留 " + ",".join(sorted(want_asn)))
-            log(f"[*] 地区标注（ip-api 批量查询）：{'；'.join(desc)} ...")
-            geo_tag(raw_rows, FOFA_TIMEOUT, DEBUG)
-            before = len(raw_rows)
-            kept = []
-            for r in raw_rows:
-                cc = (r.get("country") or "").upper()
-                if not cc:                 # 没标注上的保留，不能凭空丢掉
-                    kept.append(r)
+        asn_ports = as_list(PORTS) or ["443"]
+        exclude_nets = _parse_cidrs(FOFA_EXCLUDE_CIDRS)
+        skip_ips = _load_skip_ips(FOFA_SKIP_FILE)
+        total_stats = {"total": 0, "bad_ip": 0, "not_public": 0, "port": 0,
+                       "excluded": 0, "asn": 0, "skipped": 0, "dup": 0, "truncated": 0}
+        CHUNK = 20000
+        written = 0
+        fh, wr = open_csv_writer(csv_path)
+        buf = []
+        seen_all = set()
+        try:
+            for cand in iter_asn_candidates(asns, ASN_SAMPLE, FOFA_TIMEOUT,
+                                            FOFA_RETRIES, DEBUG):
+                buf.append(cand)
+                if len(buf) < CHUNK:
                     continue
-                if drop_asn and cc in drop_asn:
-                    continue
-                if want_asn and cc not in want_asn:
-                    continue
-                kept.append(r)
-            raw_rows = kept
-            log(f"[*] 地区筛选：{before} -> {len(raw_rows)} 条")
-            if not raw_rows:
-                log("[!] 采样到的 IP 全被地区规则筛掉了。")
-                log("    调大 -asn-sample，或放宽 -asn-regions / -asn-exclude-regions。")
-                return 4
+                rows, st = normalize(buf, set(asn_ports), exclude_nets,
+                                     skip_ips, exclude_asns, 0)
+                merge_stats(total_stats, st)
+                for r in rows:
+                    wr.writerow({k: r.get(k, "") for k in CSV_HEADER})
+                    written += 1
+                del rows
+                buf = []
+            if buf:
+                rows, st = normalize(buf, set(asn_ports), exclude_nets,
+                                     skip_ips, exclude_asns, 0)
+                merge_stats(total_stats, st)
+                for r in rows:
+                    wr.writerow({k: r.get(k, "") for k in CSV_HEADER})
+                    written += 1
+                del rows
+                buf = []
+        finally:
+            fh.close()
+
+        log(f"[*] 候选过滤：原始 {total_stats['total']:,} 条 -> 保留 {written:,} 条")
+        if not written:
+            log("[!] 没有采到任何可用地址。")
+            return 4
+        # 流式路径已经写好 CSV 了，后面通用的「归一化 / 写出」不用再走
+        log(f"[*] 已写出 {written:,} 个候选 -> {csv_path}")
+        rows_for_count = [{"x": 1}] * written          # 只用来计数，不占内存
+        stats = total_stats
+        write_status(candidates=written, kept=written, source="asn",
+                     asns=ASNS, asn_sample=ASN_SAMPLE, phase="fetched")
+
+        # ---- 实测 ----
+        if a.run or FOFA_RUN:
+            rc, avail, qual = run_tester(csv_path, extra_run_args)
+            write_status(phase="done", test_rc=rc, final=read_final_summary())
+            send_notification(round_no, avail, qual, loop_secs)
+            return rc
+        return 0
+
     else:                                    # fofa
         if not FOFA_KEY:
             log("[!] 未配置 FOFA API key。三种配置方式（任选其一）：")
@@ -2146,6 +2351,9 @@ def main():
                    help=f"ASN 采样后只保留这些地区（白名单），默认 '{ASN_REGIONS}'（空=不启用）")
     p.add_argument("-asn-exclude-regions", default=None,
                    help=f"ASN 采样后排除这些地区（黑名单），默认 '{ASN_EXCLUDE_REGIONS}'")
+    p.add_argument("-once", action="store_true",
+                   help="只跑一轮就退出（忽略配置里的 LOOP）。"
+                        "Web 面板的「立即跑一轮」和定时任务用这个。")
     p.add_argument("-ports", default=None,
                    help=f"测哪些端口，逗号分隔。CF 的 HTTPS 端口是 "
                         f"443,2053,2083,2087,2096,8443。默认 '{PORTS}'，空=不限制。"
@@ -2216,7 +2424,15 @@ def main():
         else:
             source = "fofa"
 
-    interval = max(0, a.loop or LOOP)
+    # 循环间隔：-once 最高优先（一次性跑），其次命令行 -loop，最后配置 LOOP。
+    # 注意不能写成 max(0, a.loop or LOOP) —— 那样任何一次不带 -loop 的调用
+    # 都会被配置里的 LOOP 变成常驻循环，一次性跑就永远不返回了（踩过）。
+    if a.once:
+        interval = 0
+    elif a.loop is not None:
+        interval = max(0, a.loop)
+    else:
+        interval = max(0, LOOP)
     round_no = 0
     st0 = cleanup_outputs()
     log(f"[*] 磁盘：可用 {st0['free_mb']} MB，清理释放 {st0['freed_mb']} MB "
@@ -2232,7 +2448,12 @@ def main():
                 apply_config(load_config(config_path))
                 apply_env()
                 apply_cli(a, quiet_banner=True)
-                interval = max(0, a.loop or LOOP)
+                if a.once:
+                    interval = 0
+                elif a.loop is not None:
+                    interval = max(0, a.loop)
+                else:
+                    interval = max(0, LOOP)
                 log(f"[*] 已重新加载 config.ini（间隔 {interval}s，"
                     f"档位 {ASNS}，采样 {ASN_SAMPLE}，端口 {PORTS}）")
             except Exception as e:               # noqa: BLE001

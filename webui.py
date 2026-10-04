@@ -172,6 +172,9 @@ def spawn_run():
     try:
         cmd = [sys.executable, os.path.join(HERE, "fetch_ips.py")]
         cmd += shlex.split(RUN_ARGS, posix=(os.name != "nt"))
+        # 面板的「立即跑一轮」必须是一次性的，不能受配置里 LOOP 影响
+        if "-once" not in cmd and "-loop" not in cmd:
+            cmd.append("-once")
         # 让这一轮的结果也写日志，方便面板看
         os.makedirs(LOG_DIR, exist_ok=True)
         logf = os.path.join(LOG_DIR, f"webui-run-{time.strftime('%Y%m%d-%H%M%S')}.log")
@@ -667,56 +670,131 @@ const q = TOKEN ? ('?token=' + encodeURIComponent(TOKEN)) : '';
 async function api(p, opt){ const r = await fetch(p + q, opt); return r.json(); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
+const STAGE_ORDER = ['asn', 'geo', 's1', 's2', 's3'];
+const STAGE_SHORT = {
+  asn: '抓取 ASN 网段', geo: '地区标注',
+  s1: '第一阶段 · 可用性', s2: '第二阶段 · 测速', s3: '第三阶段 · 线路'
+};
+
+function progBarHtml(k, p){
+  const pct = (p.pct != null) ? p.pct : 0;
+  const done = (p.done != null) ? p.done : 0;
+  const total = p.total || 0;
+  // 「当前任务」要一眼能看到：正在处理什么
+  let cur = '';
+  if (p.ip) {
+    cur = '正在测 <b>' + esc(p.ip) + '</b>';
+    if (p.cidr) cur += '　网段 <b>' + esc(p.cidr) + '</b>';
+    if (p.port && p.port !== '443') cur += '　端口 <b>' + esc(p.port) + '</b>';
+  } else if (p.current) {
+    cur = '正在处理 <b>' + esc(p.current) + '</b>';
+  }
+  return '<div style="margin-bottom:14px">'
+    + '<div class="row" style="margin:0 0 4px;justify-content:space-between">'
+    +   '<span><b>' + esc(p.name || STAGE_SHORT[k] || k) + '</b>'
+    +     (pct >= 100 ? ' <span class="pill on">已完成</span>' : '') + '</span>'
+    +   '<span class="k" style="margin:0">' + done.toLocaleString()
+    +     ' / ' + total.toLocaleString() + '　' + pct.toFixed(1) + '%</span>'
+    + '</div>'
+    + '<div class="bar"><i style="width:' + pct + '%"></i></div>'
+    + (cur ? '<div class="hint" style="margin-top:5px">' + cur + '</div>' : '')
+    + '</div>';
+}
+
+function renderProgress(st){
+  const prog = st.progress || {};
+  const wrap = document.getElementById('progwrap');
+  const keys = STAGE_ORDER.filter(k => prog[k]);
+  if (!keys.length) {
+    wrap.innerHTML = '<div class="hint">还没有进度信息（等扫描跑起来）</div>';
+    return;
+  }
+  // 当前任务：取第一个未完成的阶段
+  let curTask = null;
+  for (const k of keys) { if ((prog[k].pct || 0) < 100) { curTask = k; break; } }
+  if (!curTask) curTask = keys[keys.length - 1];
+  const cp = prog[curTask];
+  let head = '<div class="row" style="margin:0 0 12px">'
+    + '<span class="pill on">当前任务</span>'
+    + '<b style="font-size:15px">' + esc(cp.name || STAGE_SHORT[curTask]) + '</b>'
+    + '<span class="k" style="margin:0">第 ' + (st.round || 0) + ' 轮</span>';
+  if (cp.ip) head += '<span class="k" style="margin:0">' + esc(cp.ip)
+    + (cp.cidr ? '（' + esc(cp.cidr) + '）' : '') + '</span>';
+  else if (cp.current) head += '<span class="k" style="margin:0">' + esc(cp.current) + '</span>';
+  head += '</div>';
+  wrap.innerHTML = head + keys.map(k => progBarHtml(k, prog[k])).join('');
+}
+
+function renderTable(tbodyId, countId, rows, emptyMsg){
+  const tb = document.querySelector('#' + tbodyId + ' tbody');
+  document.getElementById(countId).textContent = '共 ' + rows.length + ' 个';
+  tb.innerHTML = rows.length ? rows.map((r, i) => '<tr>'
+    + '<td>' + esc(r.rank || i + 1) + '</td>'
+    + '<td>' + esc(r.ip) + '</td>'
+    + '<td>' + esc(r.port || '443') + '</td>'
+    + '<td>' + esc(r.score) + '</td>'
+    + '<td>' + esc(r.latency) + '</td>'
+    + '<td>' + esc(r.loss) + '</td>'
+    + '<td>' + esc(r.speed) + '</td>'
+    + '<td>' + esc(r.route) + '</td>'
+    + '<td>' + esc(r.country) + '</td>'
+    + '<td>' + esc(r.city) + '</td></tr>').join('')
+    : '<tr><td colspan="10" style="color:#8b93a7">' + emptyMsg + '</td></tr>';
+}
+
 async function refresh(){
   try{
     const st = await api('/api/status');
-    const alive = st.alive;
-    const badge = alive ? '<span class="pill on">运行中</span>'
-                        : '<span class="pill idle">空闲</span>';
+    const badge = st.alive ? '<span class="pill on">运行中</span>'
+                           : '<span class="pill idle">空闲</span>';
     document.getElementById('sub').innerHTML =
-      badge + ' 状态 <b>' + esc(st.state||'—') + '</b> · 第 <b>' + esc(st.round||0) +
-      '</b> 轮 · 更新于 ' + esc(st.updated||'—') +
-      (st.age_sec!=null ? '（' + st.age_sec + 's 前）' : '');
+      badge + ' 状态 <b>' + esc(st.state || '—') + '</b> · 第 <b>' + esc(st.round || 0)
+      + '</b> 轮 · 更新于 ' + esc(st.updated || '—')
+      + (st.age_sec != null ? '（' + st.age_sec + 's 前）' : '');
 
-    // 进度条
-    const pct = st.progress_pct;
-    document.getElementById('bar').style.width = (pct!=null?pct:0) + '%';
-    document.getElementById('stageName').textContent = '当前阶段：' + (st.stage_name || '—');
-    let info = '';
-    if (st.stage_done!=null && st.stage_total) info = st.stage_done + ' / ' + st.stage_total + '  (' + pct + '%)';
-    else if (st.last_line) info = st.last_line;
-    if (st.free_mb!=null) info += (info?'　·　':'') + '可用磁盘 ' + Math.round(st.free_mb) + ' MB';
-    document.getElementById('stageInfo').textContent = info || '—';
+    renderProgress(st);
 
     const cards = [
-      ['轮次', st.round||0],
-      ['候选总数', (st.candidates||0).toLocaleString()],
-      ['保留 IP', (st.kept||0).toLocaleString()],
-      ['数据源', st.source||'—'],
-      ['ASN 档位', st.asns||'—'],
-      ['循环间隔', st.loop? st.loop+'s' : '单次'],
+      ['轮次', st.round || 0],
+      ['候选总数', (st.candidates || 0).toLocaleString()],
+      ['保留 IP', (st.kept || 0).toLocaleString()],
+      ['数据源', st.source || '—'],
+      ['ASN 档位', st.asns || '—'],
+      ['循环间隔', st.loop ? st.loop + 's' : '单次'],
+      ['可用磁盘', (st.free_mb != null ? Math.round(st.free_mb) + ' MB' : '—')],
     ];
-    document.getElementById('stats').innerHTML = cards.map(([k,v])=>
-      '<div class="card" style="margin:0"><div class="k">'+k+'</div><div class="v sm">'+esc(v)+'</div></div>').join('');
+    document.getElementById('stats').innerHTML = cards.map(([k, v]) =>
+      '<div class="card" style="margin:0"><div class="k">' + k + '</div>'
+      + '<div class="v sm">' + esc(v) + '</div></div>').join('');
 
-    const rs = await api('/api/results');
-    const rows = rs.rows || [];
-    document.getElementById('resCount').textContent = '共 ' + rows.length + ' 个';
-    const tb = document.querySelector('#res tbody');
-    tb.innerHTML = rows.length ? rows.map((r,i)=>'<tr>'+
-      '<td>'+esc(r.rank||i+1)+'</td><td>'+esc(r.ip)+'</td><td>'+esc(r.port||'443')+'</td>'+
-      '<td>'+esc(r.score)+'</td><td>'+esc(r.latency)+'</td><td>'+esc(r.loss)+'</td>'+
-      '<td>'+esc(r.speed)+'</td><td>'+esc(r.route)+'</td><td>'+esc(r.country)+'</td>'+
-      '<td>'+esc(r.city)+'</td></tr>').join('')
-      : '<tr><td colspan="10" style="color:#8b93a7">还没有结果</td></tr>';
-    document.getElementById('iptxt').textContent = (rs.ip_txt&&rs.ip_txt.length) ? rs.ip_txt.join('\n') : '—';
+    // 两套结果
+    const all = await api('/api/results');
+    renderTable('resAll', 'resCountAll', all.rows || [], '还没有结果');
+
+    try{
+      const reg = await api('/api/results/region');
+      if (reg.exists) {
+        renderTable('resRegion', 'resCountRegion', reg.rows || [], '地区列表里暂时没有 IP');
+      } else {
+        document.getElementById('resCountRegion').textContent = '';
+        renderTable('resRegion', 'resCountRegion', [],
+          '还没有地区列表（OUTPUT_REGIONS=' + esc((reg.regions || []).join(',')) + '）');
+      }
+    }catch(e){
+      renderTable('resRegion', 'resCountRegion', [], '读取失败：' + esc(e.message));
+    }
+
+    document.getElementById('iptxt').textContent =
+      (all.ip_txt && all.ip_txt.length) ? all.ip_txt.join('\n') : '—';
 
     const lg = await api('/api/log?lines=200');
     const pre = document.getElementById('log');
-    pre.textContent = (lg.lines&&lg.lines.length) ? lg.lines.join('\n') : '（还没有日志文件，加 -log 就会生成）';
+    pre.textContent = (lg.lines && lg.lines.length) ? lg.lines.join('\n')
+      : '（还没有日志文件，加 -log 就会生成）';
     pre.scrollTop = pre.scrollHeight;
   }catch(e){
-    document.getElementById('sub').innerHTML = '<span class="err">连接失败：'+esc(e.message)+'</span>';
+    document.getElementById('sub').innerHTML =
+      '<span class="err">连接失败：' + esc(e.message) + '</span>';
   }
 }
 

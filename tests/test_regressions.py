@@ -256,12 +256,150 @@ def test_webui():
     check("推送预览可渲染", p.get("ok") is True and "轮" in p.get("title", ""))
 
 
+
+
+# ---------------------------------------------------------------- 8. 模块间变量引用
+def test_undefined_globals():
+    """又一个反复踩的坑：变量定义在 A 模块、却在 B 模块里引用，
+    运行时 NameError，而且常被外层 except 吞掉，表现成「接口返回空」。
+
+    这里用 AST 扫一遍：每个模块里被【读取】但从未在该模块【定义/导入/赋值】
+    的全局名，列出来。
+    """
+    import ast
+    import builtins
+
+    for fname in ("fetch_ips.py", "ip.py", "webui.py", "notify.py"):
+        path = os.path.join(ROOT, fname)
+        src = open(path, encoding="utf-8").read()
+        tree = ast.parse(src)
+
+        # 模块级定义的名字
+        defined = set(dir(builtins))
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                tgts = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in tgts:
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name):
+                            defined.add(n.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for al in node.names:
+                    defined.add((al.asname or al.name).split(".")[0])
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.Try):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Assign):
+                        for t in sub.targets:
+                            for n in ast.walk(t):
+                                if isinstance(n, ast.Name):
+                                    defined.add(n.id)
+            elif isinstance(node, (ast.If, ast.For, ast.While)):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Assign):
+                        for t in sub.targets:
+                            for n in ast.walk(t):
+                                if isinstance(n, ast.Name):
+                                    defined.add(n.id)
+
+        # 函数里 global 声明 + 局部赋值也算
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Global):
+                defined.update(node.names)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                        defined.add(sub.id)
+                    if isinstance(sub, ast.arg):
+                        defined.add(sub.arg)
+                    if isinstance(sub, ast.ExceptHandler) and sub.name:
+                        defined.add(sub.name)
+
+        # 找出「读取但未定义」的（只查看起来像模块级常量的全大写名，减少误报）
+        suspect = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                nm = node.id
+                if nm.isupper() and len(nm) > 2 and nm not in defined:
+                    suspect.add(nm)
+        check(f"{fname} 没有未定义的大写常量引用", not suspect,
+              f"疑似未定义: {sorted(suspect)}")
+
+
+# ---------------------------------------------------------------- 9. 流式采样
+def test_streaming_sampling():
+    """流式改造引入的两个函数，必须和「真展开再抽」等价。"""
+    import ipaddress
+    import random
+    import fetch_ips as ff
+
+    nets = [ipaddress.ip_network("10.0.0.0/22"), ipaddress.ip_network("10.1.0.0/24"),
+            ipaddress.ip_network("10.2.0.0/23"), ipaddress.ip_network("10.3.0.0/25")]
+
+    # count_24s 要和真展开一致
+    fast = ff.count_24s(nets)
+    slow = 0
+    for n in nets:
+        slow += len(list(n.subnets(new_prefix=24))) if n.prefixlen <= 24 else 1
+    check("count_24s 与真展开一致", fast == slow, f"{fast} vs {slow}")
+
+    # sample_24s 不能有重复
+    random.seed(5)
+    got = ff.sample_24s(nets, 8)
+    check("sample_24s 无重复", len(got) == len(set(got)), f"{len(got)} 个里 {len(set(got))} 唯一")
+
+    # 取超过总数时应截断且不重复
+    got2 = ff.sample_24s(nets, 9999)
+    check("sample_24s 超量请求被截断", len(got2) == fast and len(got2) == len(set(got2)),
+          f"要 9999 得 {len(got2)}，唯一 {len(set(got2))}")
+
+    # 结果必须都是 /24 对齐、且落在给定网段内
+    aligned = all(a % 256 == 0 for a in got)
+    import ipaddress as _ip
+    inside = all(any(_ip.IPv4Address(a) in n for n in nets if n.prefixlen <= 24) or
+                 any(a == int(n.network_address) for n in nets) for a in got)
+    check("sample_24s 结果都是 /24 首地址", aligned)
+    check("sample_24s 结果都落在给定网段内", inside)
+
+
+# ---------------------------------------------------------------- 10. 一次性运行
+def test_once_semantics():
+    """配置里加了 LOOP 之后，曾经写成 max(0, a.loop or LOOP)，
+    导致任何不带 -loop 的调用都变成常驻循环、永远不返回（实测卡死）。
+    """
+    src = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    # 只看代码行，注释里提到这个错误写法是正常的（就是解释为什么不能这么写）
+    code_lines = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    code = chr(10).join(code_lines)
+    check("没有 a.loop or LOOP 这种写法", "a.loop or LOOP" not in code)
+    check("有 -once 参数", '"-once"' in src)
+    check("-once 时 interval 归零", "if a.once:" in src and "interval = 0" in src)
+
+    # webui 的一次性触发要带 -once
+    w = open(os.path.join(ROOT, "webui.py"), encoding="utf-8").read()
+    check("webui 一次性跑会补 -once", '"-once" not in cmd' in w)
+
+
+# ---------------------------------------------------------------- 11. 两套结果
+def test_two_datasets():
+    """主 CSV 不能被地区版 CSV 顶掉。"""
+    src = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    check("read_final_summary 排除地区版 CSV", "地区版，跳过" in src)
+    check("fetch_ips 有 OUTPUT_REGIONS", 'OUTPUT_REGIONS = "HK' in src)
+    ip_src = open(os.path.join(ROOT, "ip.py"), encoding="utf-8").read()
+    check("ip.py 产出两套文件", "def _write_txt" in ip_src and "OUTPUT_SPLIT" in ip_src)
+    check("ip.py 有地区白名单", "OUTPUT_REGIONS" in ip_src)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  回归测试")
     print("=" * 62)
     for fn in (test_globals_declared, test_full_scan, test_cleanup,
-               test_multiport, test_notify_summary, test_files_ok, test_webui):
+               test_multiport, test_notify_summary, test_files_ok, test_webui,
+               test_undefined_globals, test_streaming_sampling,
+               test_once_semantics, test_two_datasets):
         print(f"\n[{fn.__name__}] {fn.__doc__.splitlines()[0] if fn.__doc__ else ''}")
         try:
             fn()

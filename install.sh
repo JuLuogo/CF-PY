@@ -325,7 +325,9 @@ EnvironmentFile=${INSTALL_DIR}/cfip.env
 # 脚本里已经有代码级兜底（sys.stdout.reconfigure），这里再加一层保险。
 Environment=PYTHONIOENCODING=utf-8
 Environment=PYTHONUTF8=1
-ExecStart=/usr/bin/env python3 fetch_ips.py -source asn -loop ${LOOP} -run -- -threads ${THREADS} -d 5 -log -quiet
+# 不再写死 -loop：间隔由 config.ini 的 LOOP 控制，
+# 这样 Web 面板改完下一轮就生效，不用改 unit 文件重载。
+ExecStart=/usr/bin/env python3 fetch_ips.py -source asn -run -- -d 5 -log -quiet
 Restart=always
 RestartSec=30
 # ping / traceroute 需要 raw socket
