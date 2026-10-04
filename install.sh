@@ -320,6 +320,53 @@ if [ "$WEB_ENABLE" = "y" ]; then
   systemctl enable --now cfip-web.service >/dev/null 2>&1 && ok "cfip-web.service 已启动" || warn "Web 服务启动失败"
 fi
 
+# ---------------------------------------------------------------- 防火墙
+# 对外开放时，必须同时放行系统防火墙。云厂商的安全组在控制台里，
+# 脚本改不了，只能明确提示 —— 这是「面板打不开」最常见的原因。
+if [ "$WEB_ENABLE" = "y" ] && [ "$WEB_HOST" = "0.0.0.0" ]; then
+  info "处理系统防火墙（云厂商安全组需要你手动去控制台放行）"
+  FW_DONE=0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "${WEB_PORT}/tcp" >/dev/null 2>&1 && ok "ufw 已放行 ${WEB_PORT}/tcp" || warn "ufw 放行失败，手动执行：ufw allow ${WEB_PORT}/tcp"
+    FW_DONE=1
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+    firewall-cmd --permanent --add-port="${WEB_PORT}/tcp" >/dev/null 2>&1 \
+      && firewall-cmd --reload >/dev/null 2>&1 \
+      && ok "firewalld 已放行 ${WEB_PORT}/tcp" \
+      || warn "firewalld 放行失败，手动执行：firewall-cmd --permanent --add-port=${WEB_PORT}/tcp && firewall-cmd --reload"
+    FW_DONE=1
+  fi
+  [ "$FW_DONE" = "0" ] && ok "没检测到启用的系统防火墙（ufw/firewalld），跳过"
+
+  # 云厂商识别，给出对应的安全组操作路径
+  VENDOR=""
+  [ -f /sys/class/dmi/id/product_name ] && VENDOR=$(cat /sys/class/dmi/id/product_name 2>/dev/null)
+  case "$VENDOR" in
+    *Alibaba*|*ecs*) CLOUD="阿里云 ECS —— ECS 控制台 → 安全组 → 配置规则 → 入方向 → 添加 TCP ${WEB_PORT}/0.0.0.0/0" ;;
+    *Tencent*|*CVM*) CLOUD="腾讯云 —— 控制台 → 防火墙/安全组 → 添加 TCP ${WEB_PORT}" ;;
+    *Huawei*)        CLOUD="华为云 —— ECS → 安全组 → 入方向规则 → 添加 TCP ${WEB_PORT}" ;;
+    *Amazon*|*AWS*)  CLOUD="AWS —— EC2 → Security Groups → Inbound → Custom TCP ${WEB_PORT}" ;;
+    *)               CLOUD="你的云控制台 → 安全组/防火墙 → 入方向放行 TCP ${WEB_PORT}" ;;
+  esac
+  warn "还要去云控制台放行！${CLOUD}"
+  warn "这是面板打不开最常见的原因 —— 操作系统里改了没用。"
+
+  # 自测：从公网 IP 连一下自己
+  sleep 2
+  PUB=$(curl -fsS --max-time 6 https://api.ipify.org 2>/dev/null \
+        || curl -fsS --max-time 6 https://ifconfig.me 2>/dev/null || echo "")
+  if [ -n "$PUB" ]; then
+    CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 6 "http://${PUB}:${WEB_PORT}/healthz" 2>/dev/null || echo "000")
+    if [ "$CODE" = "200" ]; then
+      ok "自测通过：http://${PUB}:${WEB_PORT}/healthz 返回 200"
+    else
+      warn "自测失败（HTTP ${CODE}）：服务在跑但公网连不上，多半是安全组没放行"
+      warn "诊断：bash ${INSTALL_DIR}/check.sh ${WEB_PORT}"
+    fi
+  fi
+fi
+
 sleep 2
 printf '\n'
 printf '%s\n' "${BLD}============================================================${RST}"

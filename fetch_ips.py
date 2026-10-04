@@ -1604,6 +1604,63 @@ def set_progress(stage, done=None, total=None, name="", extra=None):
     write_status(**d)
 
 
+# ==================== 每日请求额度守卫 ====================
+# 每次可用性检查 = 1 个请求打到 AVAILABILITY_HOST（你自己的域名），
+# 每次测速 = 1 个请求。如果那个域名有每日额度（比如 Cloudflare Worker
+# 免费版 10 万次/天），跑爆了会导致后续所有检查失败。
+# 这里按天计数，额度不够就跳过本轮并告警，而不是把额度烧光。
+DAILY_REQUEST_LIMIT = 0        # 每天请求上限，0 = 不限制
+REQUEST_COUNT_FILE = "./output/request_count.json"
+# 每轮请求数估算系数：候选数 × 这个值（1 = 只算可用性检查，
+# 1.5 ≈ 再加上约 50% 通过第一阶段后的测速请求）
+REQUEST_EST_FACTOR = 1.5
+
+
+def _today():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def load_request_count():
+    """读今天的请求计数；跨天自动归零。"""
+    path = REQUEST_COUNT_FILE if os.path.isabs(REQUEST_COUNT_FILE) \
+        else os.path.join(HERE, REQUEST_COUNT_FILE)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            d = json.load(f) or {}
+    except (OSError, json.JSONDecodeError):
+        d = {}
+    if d.get("date") != _today():
+        return {"date": _today(), "used": 0}
+    return {"date": d.get("date"), "used": int(d.get("used") or 0)}
+
+
+def add_request_count(n):
+    """给今天的计数加上 n 个请求。"""
+    path = REQUEST_COUNT_FILE if os.path.isabs(REQUEST_COUNT_FILE) \
+        else os.path.join(HERE, REQUEST_COUNT_FILE)
+    cur = load_request_count()
+    cur["used"] = int(cur.get("used") or 0) + max(0, int(n))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return cur["used"]
+
+
+def budget_check(planned):
+    """额度够不够跑这一轮？返回 (是否放行, 已用, 上限, 剩余)。"""
+    if not DAILY_REQUEST_LIMIT:
+        return True, 0, 0, -1
+    cur = load_request_count()
+    used = cur["used"]
+    remaining = DAILY_REQUEST_LIMIT - used
+    return (used + planned <= DAILY_REQUEST_LIMIT), used, DAILY_REQUEST_LIMIT, remaining
+
+
 # ==================== 状态文件（给 Web UI 读） ====================
 STATUS_FILE = "./output/status.json"
 
