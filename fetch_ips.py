@@ -263,6 +263,7 @@ def apply_config(cfg):
     global THREADS, LOOP
     global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE, FULL_SCAN
     global POOL_ENABLED, POOL_FILE, POOL_MAX_AGE_DAYS
+    global UPSTREAM_STAGE1_ONLY, POOL_MODE
 
     get = cfg.get
     if "FOFA_API_BASE" in cfg:        FOFA_API_BASE = str(get("FOFA_API_BASE")).strip() or FOFA_API_BASE
@@ -312,6 +313,10 @@ def apply_config(cfg):
     if "POOL_ENABLED" in cfg:         POOL_ENABLED = as_bool(get("POOL_ENABLED"), POOL_ENABLED)
     if "POOL_FILE" in cfg:            POOL_FILE = str(get("POOL_FILE") or POOL_FILE).strip().strip('"')
     if "POOL_MAX_AGE_DAYS" in cfg:    POOL_MAX_AGE_DAYS = as_int(get("POOL_MAX_AGE_DAYS"), POOL_MAX_AGE_DAYS)
+    if "UPSTREAM_STAGE1_ONLY" in cfg:
+        UPSTREAM_STAGE1_ONLY = as_bool(get("UPSTREAM_STAGE1_ONLY"), UPSTREAM_STAGE1_ONLY)
+    if "POOL_MODE" in cfg:
+        POOL_MODE = str(get("POOL_MODE") or "auto").strip().strip('"').lower()
     if "OUTPUT_REGIONS" in cfg:
         OUTPUT_REGIONS = str(get("OUTPUT_REGIONS") or "").strip().strip('"')
     if "OUTPUT_SPLIT" in cfg:         OUTPUT_SPLIT = as_bool(get("OUTPUT_SPLIT"), OUTPUT_SPLIT)
@@ -1447,7 +1452,14 @@ def run_tester(csv_path, extra_args):
         log(f"[*] 提示：注册表里系统代理仍是开着的（{sysproxy}），"
             f"但 curl 不读注册表、路由也没被劫持，本次测量是直连的。")
 
-    cmd = [sys.executable, os.path.join(HERE, "ip.py"), "-i", csv_path] + list(extra_args)
+    extra_args = list(extra_args)
+    # 上游只做「发现」：确认是不是真反代就够了，不做质量筛选。
+    # VPS 在海外，它测出来的延迟/速度对国内家用网络没有参考价值，
+    # 质量排序是下游（家里 NAS）的活。用 -stage1 只交回真反代。
+    if UPSTREAM_STAGE1_ONLY and "-stage1" not in extra_args:
+        extra_args = ["-stage1", "-o", STAGE1_CSV] + extra_args
+        log("[*] 上游模式：只做 stage1（可用性），不做质量筛选")
+    cmd = [sys.executable, os.path.join(HERE, "ip.py"), "-i", csv_path] + extra_args
     log(f"\n[*] 调用测试脚本：{' '.join(cmd)}\n")
 
     avail = qual = None
@@ -1727,6 +1739,25 @@ POOL_ENABLED = True
 POOL_FILE = "./output/pool.csv"
 POOL_MAX_AGE_DAYS = 30      # 超过这么多天没再出现的条目才淘汰
 
+# 上游只保留 stage1 的结果。
+#   stage1 通过 = 它【确实是】反代（客观事实，跟测量点无关）
+#   stage2 通过 = 它【在这台 VPS 上】快、不丢包（主观，跟测量点强相关）
+# 上游 VPS 在海外机房，测出来的延迟/速度对国内家用网络没有参考价值，
+# 质量排序是下游（家里 NAS）的活。所以上游池子里只放"所有真反代"。
+UPSTREAM_STAGE1_ONLY = True
+
+# 池子更新方式：
+#   auto    全量扫完 -> 替换；中途中断 -> 并集（见下）
+#   replace 永远替换
+#   merge   永远并集
+# 为什么中断时要并集：全量扫描时「没出现 = 测了且失败」，可以做差集；
+# 但只扫了一部分时「没出现」可能只是没扫到，做差集会误杀。
+# 这时只能把新发现的并进去，不能删旧的。
+POOL_MODE = "auto"
+
+# 上游 stage1 的结果落这里，然后被读进池子
+STAGE1_CSV = "./output/stage1.csv"
+
 POOL_HEADER = ["ip", "port", "first_seen", "last_seen", "seen_count",
                "latency", "loss", "speed", "score",
                "cfcountry", "country", "city", "route", "colo"]
@@ -1761,17 +1792,27 @@ def _fnum(v):
         return None
 
 
-def merge_pool(rows, prune=True):
-    """把一轮的结果并进池子。返回 (池子总数, 本轮新增, 本轮更新, 淘汰数)。
+def update_pool(rows, complete=True):
+    """用这一轮的结果更新池子。返回 (池子总数, 新增, 更新, 删除)。
 
-    同一个 ip:port 再次出现时：更新 last_seen / 指标，seen_count +1，
-    保留最早的 first_seen —— 这样能看出一个 IP 到底稳定了多久。
+    complete=True（整轮扫完了）：
+        全量扫描下每个 IP 都测过，「没出现在结果里」= 测了且失败 = 确定死亡。
+        所以直接【替换】—— 旧池子里没被这轮确认的全部丢掉。
+        这正是用户要的语义：第二轮扫的时候已经不能用了，留着没意义。
+    complete=False（中途崩了/被重启）：
+        只扫了一部分，「没出现」可能只是没扫到，做差集会误杀。
+        这时只能把新发现的【并】进去，不能删旧的。
     """
     if not POOL_ENABLED:
         return 0, 0, 0, 0
 
-    pool = load_pool()
+    mode = POOL_MODE
+    if mode == "auto":
+        mode = "replace" if complete else "merge"
+
+    old_pool = load_pool()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_pool = {}
     added = updated = 0
 
     for r in rows or []:
@@ -1780,51 +1821,58 @@ def merge_pool(rows, prune=True):
             continue
         port = str(r.get("port") or "443").strip() or "443"
         key = (ip, port)
-        old = pool.get(key)
-        if old:
+        prev = old_pool.get(key)
+        if prev:
             updated += 1
-            old.update({
-                "last_seen": now,
-                "seen_count": str(int(old.get("seen_count") or 1) + 1),
-                "latency": str(r.get("latency") or old.get("latency") or ""),
-                "loss": str(r.get("loss") or old.get("loss") or ""),
-                "speed": str(r.get("speed") or old.get("speed") or ""),
-                "score": str(r.get("score") or old.get("score") or ""),
-                "country": str(r.get("country") or old.get("country") or ""),
-                "city": str(r.get("city") or old.get("city") or ""),
-                "route": str(r.get("route") or old.get("route") or ""),
-                "cfcountry": str(r.get("cfcountry") or old.get("cfcountry") or ""),
-            })
+            first = prev.get("first_seen") or now
+            seen = int(prev.get("seen_count") or 1) + 1
         else:
             added += 1
-            pool[key] = {
-                "ip": ip, "port": port,
-                "first_seen": now, "last_seen": now, "seen_count": "1",
-                "latency": str(r.get("latency") or ""),
-                "loss": str(r.get("loss") or ""),
-                "speed": str(r.get("speed") or ""),
-                "score": str(r.get("score") or ""),
-                "cfcountry": str(r.get("cfcountry") or ""),
-                "country": str(r.get("country") or ""),
-                "city": str(r.get("city") or ""),
-                "route": str(r.get("route") or ""),
-                "colo": str(r.get("colo") or ""),
-            }
+            first = now
+            seen = 1
+        new_pool[key] = {
+            "ip": ip, "port": port,
+            "first_seen": first, "last_seen": now, "seen_count": str(seen),
+            "cfcountry": str(r.get("cfcountry") or (prev or {}).get("cfcountry") or ""),
+            "colo": str(r.get("colo") or (prev or {}).get("colo") or ""),
+            "country": str(r.get("country") or (prev or {}).get("country") or ""),
+            "city": str(r.get("city") or (prev or {}).get("city") or ""),
+            "latency": str(r.get("latency") or ""),
+            "loss": str(r.get("loss") or ""),
+            "speed": str(r.get("speed") or ""),
+            "score": str(r.get("score") or ""),
+            "route": str(r.get("route") or ""),
+        }
 
-    # 淘汰太久没出现的
+    # merge 模式：旧池子里这轮没确认的也保留
     dropped = 0
-    if prune and POOL_MAX_AGE_DAYS:
+    if mode == "merge":
+        for key, row in old_pool.items():
+            if key not in new_pool:
+                new_pool[key] = row
+    else:
+        dropped = len(old_pool) - updated
+
+    # 过期淘汰（两种模式都做，防止池子无限膨胀）
+    if POOL_MAX_AGE_DAYS:
         cutoff = datetime.now() - timedelta(days=POOL_MAX_AGE_DAYS)
-        for key in list(pool.keys()):
-            ls = (pool[key].get("last_seen") or "").strip()
+        for key in list(new_pool.keys()):
+            ls = (new_pool[key].get("last_seen") or "").strip()
             try:
                 if datetime.strptime(ls, "%Y-%m-%d %H:%M:%S") < cutoff:
-                    del pool[key]
+                    del new_pool[key]
                     dropped += 1
             except ValueError:
                 pass
 
-    # 写回（原子替换，避免中途崩了把池子写坏）
+    _write_pool(new_pool)
+    log(f"[*] 池子更新（{mode}）：共 {len(new_pool)} 个"
+        f"（新增 {added}，确认 {updated}，移除 {dropped}）")
+    return len(new_pool), added, updated, dropped
+
+
+def _write_pool(pool):
+    """原子写池子（临时文件 + os.replace），中途崩了不会写坏。"""
     path = _pool_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1838,7 +1886,10 @@ def merge_pool(rows, prune=True):
     except OSError as e:
         log(f"[!] 写池子失败：{e}")
 
-    return len(pool), added, updated, dropped
+
+# 兼容旧名字
+def merge_pool(rows, prune=True):
+    return update_pool(rows, complete=False)
 
 
 def pool_summary():
@@ -1954,6 +2005,33 @@ def write_status(**kw):
         os.replace(tmp, path)
     except OSError:
         pass
+
+
+def read_stage1_results():
+    """读上游 stage1 的结果文件（ip.py -stage1 写的）。
+
+    格式：ip, port, protocol, cfcountry, colo
+    这些就是「所有确认是真反代的 IP」—— 上游池子的内容。
+    """
+    path = STAGE1_CSV if os.path.isabs(STAGE1_CSV) else os.path.join(HERE, STAGE1_CSV)
+    out = []
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                ip = (row.get("ip") or "").strip()
+                if not ip:
+                    continue
+                out.append({
+                    "ip": ip,
+                    "port": str(row.get("port") or "443").strip() or "443",
+                    "cfcountry": (row.get("cfcountry") or "").strip().upper(),
+                    "colo": (row.get("colo") or "").strip().upper(),
+                })
+    except (OSError, csv.Error) as e:
+        log(f"[!] 读 stage1 结果失败：{e}")
+    return out
 
 
 def read_pool_rows(limit=500, region=None, max_age_days=None):
@@ -2388,9 +2466,16 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
         if a.run or FOFA_RUN:
             rc, avail, qual = run_tester(csv_path, extra_run_args)
             final = read_final_summary()
+            # 这一轮是否【扫全了】。只有扫全了才能做差集（替换）：
+            # 全量扫描下「没出现在结果里」= 测了且失败 = 确定死亡；
+            # 中途中断时「没出现」可能只是没扫到，做差集会误杀。
+            complete = (rc == 0)
             if POOL_ENABLED:
-                total, added, upd, dropped = merge_pool(final.get("rows") or [])
-                log(f"[*] 池子：共 {total} 个（本轮新增 {added}，更新 {upd}，淘汰 {dropped}）")
+                if UPSTREAM_STAGE1_ONLY:
+                    pool_rows = read_stage1_results()
+                else:
+                    pool_rows = final.get("rows") or []
+                update_pool(pool_rows, complete=complete)
             write_status(phase="done", test_rc=rc, final=final,
                          pool=pool_summary() if POOL_ENABLED else None)
             send_notification(round_no, avail, qual, loop_secs)
@@ -2465,11 +2550,16 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
     if a.run or FOFA_RUN:
         rc, avail, qual = run_tester(csv_path, extra_run_args)
         final = read_final_summary()
-        # 把这一轮的结果【并进】池子，而不是覆盖 ——
-        # 上游 5~7 天才跑一轮，某一轮抖动/被限流不该让下游的池子缩水
+        # 这一轮是否【扫全了】。只有扫全了才能做差集（替换）：
+        # 全量扫描下「没出现在结果里」= 测了且失败 = 确定死亡；
+        # 中途中断时「没出现」可能只是没扫到，做差集会误杀。
+        complete = (rc == 0)
         if POOL_ENABLED:
-            total, added, upd, dropped = merge_pool(final.get("rows") or [])
-            log(f"[*] 池子：共 {total} 个（本轮新增 {added}，更新 {upd}，淘汰 {dropped}）")
+            if UPSTREAM_STAGE1_ONLY:
+                pool_rows = read_stage1_results()
+            else:
+                pool_rows = final.get("rows") or []
+            update_pool(pool_rows, complete=complete)
         write_status(phase="done", test_rc=rc, final=final,
                      pool=pool_summary() if POOL_ENABLED else None)
         send_notification(round_no, avail, qual, loop_secs)
