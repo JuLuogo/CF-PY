@@ -261,7 +261,7 @@ def apply_config(cfg):
     global ASNS, ASN_SAMPLE, ASN_REGIONS, ASN_EXCLUDE_REGIONS
     global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
     global THREADS, LOOP
-    global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE, FULL_SCAN
+    global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE, FULL_SCAN, SUB_BATCH
     global POOL_ENABLED, POOL_FILE, POOL_MAX_AGE_DAYS, POOL_MIN_KEEP_RATIO
     global UPSTREAM_STAGE1_ONLY, POOL_MODE
 
@@ -309,6 +309,7 @@ def apply_config(cfg):
         NOTIFY_ONLY_WITH_RESULT = as_bool(get("NOTIFY_ONLY_WITH_RESULT"), NOTIFY_ONLY_WITH_RESULT)
     if "PORTS" in cfg:                PORTS = str(get("PORTS") or "").strip()
     if "CHUNK_SIZE" in cfg:          CHUNK_SIZE = as_int(get("CHUNK_SIZE"), CHUNK_SIZE)
+    if "SUB_BATCH" in cfg:            SUB_BATCH = max(1000, as_int(get("SUB_BATCH"), SUB_BATCH))
     if "FULL_SCAN" in cfg:            FULL_SCAN = as_bool(get("FULL_SCAN"), FULL_SCAN)
     if "POOL_ENABLED" in cfg:         POOL_ENABLED = as_bool(get("POOL_ENABLED"), POOL_ENABLED)
     if "POOL_FILE" in cfg:            POOL_FILE = str(get("POOL_FILE") or POOL_FILE).strip().strip('"')
@@ -925,6 +926,9 @@ PORTS = "443"
 # （不排除的话，地区版是后写的、mtime 更新，会被当成主结果读出来）。
 OUTPUT_REGIONS = "HK,JP,SG,KR,TW"
 CHUNK_SIZE = 20000
+# 逐 ASN 流水线里每个子批的大小。峰值内存 ≈ 这个数 x 250 字节
+# （5 万 -> 约 12MB）。调小更省内存，调大吞吐略高。
+SUB_BATCH = 50000
 
 # ==================== 全量扫描 ====================
 # 每个 /24 是 254 个独立主机（unicast），不是 anycast。
@@ -2185,9 +2189,14 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
         wr = csv.writer(fh)
         wr.writerow(["ip", "port", "protocol", "cfcountry", "colo"])
 
-        for asn, cands in iter_asn_batches(asns, sample, FOFA_TIMEOUT, FOFA_RETRIES, DEBUG):
-            asn_done += 1
-            set_progress("asn", "抓取 · 查询 ASN 宣告网段", asn_done, total_asns, current=asn)
+        last_asn = None
+        for asn, cands in iter_asn_batches(asns, sample, FOFA_TIMEOUT, FOFA_RETRIES,
+                                           DEBUG, sub_batch=SUB_BATCH):
+            # 同一个 ASN 可能分多批过来，只在换 ASN 时计一次数
+            if asn != last_asn:
+                asn_done += 1
+                last_asn = asn
+                set_progress("asn", "抓取 · 查询 ASN 宣告网段", asn_done, total_asns, current=asn)
             if not cands:
                 continue
 
@@ -2311,7 +2320,7 @@ def sample_24s(nets, k, weights=None, total=None):
     return out
 
 
-def iter_asn_batches(asns, sample, timeout, retries, debug=False):
+def iter_asn_batches(asns, sample, timeout, retries, debug=False, sub_batch=50000):
     """逐个 ASN 产出 (asn, [候选 dict])，边产边释放。
 
     和 iter_asn_candidates 的区别：那个是一条条 yield 候选，
@@ -2373,6 +2382,10 @@ def iter_asn_batches(asns, sample, timeout, retries, debug=False):
                             addrs.append(int(n.network_address))
                 del nets
 
+                # 关键：ASN 内部还要再分批。
+                # 一个大 ASN（vps 档位的 AS45102 有 12.3 万个 /24）全量展开是
+                # 3140 万个候选，一次性建成列表会吃掉几个 GB。
+                # 按 sub_batch 切块 yield，峰值只跟块大小有关。
                 out = []
                 for base in addrs:
                     if FULL_SCAN:
@@ -2382,8 +2395,12 @@ def iter_asn_batches(asns, sample, timeout, retries, debug=False):
                     else:
                         out.append({"ip": str(ipaddress.IPv4Address(base + random.randint(1, 254))),
                                     "port": "443", "protocol": "https", "country": ""})
+                    if len(out) >= sub_batch:
+                        yield asn, out
+                        out = []
                 del addrs
-                yield asn, out
+                if out:
+                    yield asn, out
                 del out
     finally:
         try:

@@ -474,6 +474,13 @@ def test_no_bulk_candidate_file():
     # 结果文件必须是小文件：池子/stage1 而不是候选
     check("stage1 结果文件路径存在", "STAGE1_CSV" in src)
 
+    # ASN 内部还要再分批：vps 档位的 AS45102 有 12.3 万个 /24，
+    # 全量展开是 3140 万个候选，一次性建列表要 5.6GB（实测推算），
+    # 而机器只有 726MB。必须按 SUB_BATCH 切块。
+    check("iter_asn_batches 支持子批", "sub_batch=50000" in src)
+    check("ASN 内部按 sub_batch 切块", "if len(out) >= sub_batch" in src)
+    check("有 SUB_BATCH 配置", "SUB_BATCH = 50000" in src)
+
 
 # ---------------------------------------------------------------- 14. 池子安全阀
 def test_pool_safety():
