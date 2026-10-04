@@ -706,7 +706,8 @@ def ipinfo_city(ip, timeout=5):
 
 
 # ==================== CSV ====================
-def load_ips(path):
+def _open_csv_any_encoding(path):
+    """按可能的编码依次尝试打开 CSV。返回 (file, reader, 列名映射)。"""
     for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
         try:
             f = open(path, "r", encoding=enc, newline="")
@@ -720,46 +721,92 @@ def load_ips(path):
         print("[!] 无法读取CSV编码", file=sys.stderr)
         sys.exit(1)
 
-    out = []
+    reader = csv.DictReader(f)
+    if not reader.fieldnames:
+        f.close()
+        print("[!] CSV缺少表头", file=sys.stderr)
+        sys.exit(1)
+    names = [x.strip().lower() for x in reader.fieldnames]
+    cols = {
+        "ip": next((reader.fieldnames[i] for i, n in enumerate(names) if n == "ip"), None),
+        "country": next((reader.fieldnames[i] for i, n in enumerate(names)
+                         if n in {"country", "country_code", "cc"}), None),
+        "city": next((reader.fieldnames[i] for i, n in enumerate(names) if n == "city"), None),
+        "port": next((reader.fieldnames[i] for i, n in enumerate(names) if n == "port"), None),
+    }
+    if not cols["ip"]:
+        f.close()
+        print("[!] CSV中没有ip列", file=sys.stderr)
+        sys.exit(1)
+    return f, reader, cols
+
+
+def _row_to_item(row, cols):
+    """CSV 一行 -> 候选 dict。无效返回 None。"""
+    ip = (row.get(cols["ip"]) or "").strip()
+    if not valid_ip(ip):
+        return None
+    # 端口：CSV 里没有 port 列或为空就默认 443。
+    # CF 支持的 HTTPS 端口是 443/2053/2083/2087/2096/8443，
+    # 只测 443 会丢掉近一半的反代（公开列表里 443 只占 57%）。
+    port = "443"
+    if cols["port"]:
+        pv = (row.get(cols["port"]) or "").strip()
+        if pv.isdigit() and 1 <= int(pv) <= 65535:
+            port = pv
+    return {
+        "ip": ip,
+        "port": port,
+        "input_country": (row.get(cols["country"]) or "").strip().upper() if cols["country"] else "",
+        "input_city": (row.get(cols["city"]) or "").strip() if cols["city"] else "",
+    }
+
+
+def iter_ips_chunked(path, chunk_size=20000):
+    """流式读 CSV：一次产出一批候选，峰值内存只跟 chunk_size 有关。
+
+    18 万个候选全读进来再测，光输入列表就 42MB；分批后只有一批在内存里。
+    去重键 ip:port 用一个字符串集合维持（比 dict 轻得多）。
+    """
+    f, reader, cols = _open_csv_any_encoding(path)
     seen = set()
+    buf = []
     with f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames:
-            print("[!] CSV缺少表头", file=sys.stderr)
-            sys.exit(1)
-        names = [x.strip().lower() for x in reader.fieldnames]
-        ipcol = next((reader.fieldnames[i] for i, n in enumerate(names) if n == "ip"), None)
-        ccol = next((reader.fieldnames[i] for i, n in enumerate(names)
-                     if n in {"country", "country_code", "cc"}), None)
-        citycol = next((reader.fieldnames[i] for i, n in enumerate(names) if n == "city"), None)
-        portcol = next((reader.fieldnames[i] for i, n in enumerate(names) if n == "port"), None)
-        if not ipcol:
-            print("[!] CSV中没有ip列", file=sys.stderr)
-            sys.exit(1)
         for row in reader:
-            ip = (row.get(ipcol) or "").strip()
-            if not valid_ip(ip):
+            item = _row_to_item(row, cols)
+            if item is None:
                 continue
-            # 端口：CSV 里没有 port 列或为空就默认 443。
-            # CF 支持的 HTTPS 端口是 443/2053/2083/2087/2096/8443，
-            # 只测 443 会丢掉近一半的反代（公开列表里 443 只占 57%）。
-            port = "443"
-            if portcol:
-                pv = (row.get(portcol) or "").strip()
-                if pv.isdigit() and 1 <= int(pv) <= 65535:
-                    port = pv
-            # 去重键是 ip:port —— 同一个 IP 的不同端口是两个不同的反代入口
-            key = f"{ip}:{port}"
+            key = f"{item['ip']}:{item['port']}"
             if key in seen:
                 continue
             seen.add(key)
-            out.append({
-                "ip": ip,
-                "port": port,
-                "input_country": (row.get(ccol) or "").strip().upper() if ccol else "",
-                "input_city": (row.get(citycol) or "").strip() if citycol else ""
-            })
-    log(f"[*] 加载 {len(out)} 个唯一IP")
+            buf.append(item)
+            if len(buf) >= chunk_size:
+                yield buf
+                buf = []
+    if buf:
+        yield buf
+
+
+def count_ips(path):
+    """只数有多少条（不建列表），用来打日志。"""
+    n = 0
+    for chunk in iter_ips_chunked(path, 50000):
+        n += len(chunk)
+    return n
+
+
+def load_ips(path):
+    """一次性读全部候选（保留给需要随机访问的场景；主流程走 iter_ips_chunked）。"""
+    out = []
+    seen = set()
+    for chunk in iter_ips_chunked(path, 50000):
+        for item in chunk:
+            key = f"{item['ip']}:{item['port']}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
     return out
 
 
@@ -1048,9 +1095,42 @@ def availability(ip, timeout=CURL_TIMEOUT_SEC, port="443"):
     return info if info.get("cfcountry") else None
 
 
+def stage1_streaming(path, threads, chunk_size=20000):
+    """流式第一阶段：分批读 CSV -> 分批测 -> 只累积通过的那些。
+
+    为什么：18 万个候选全读进内存再测，光输入列表就 42MB，加上
+    Future/结果对象峰值上百 MB。分批后同时只有一批在内存里，
+    通过的（通常只占少数）累积下来交给第二阶段。
+    """
+    out = []
+    seen_total = 0
+    t0 = time.time()
+    log(f"\n[*] 第一阶段：流式读取 {os.path.basename(path)}，"
+        f"每批 {chunk_size} 个，并发 "
+        f"{max(ASYNCIO_CONCURRENCY, threads) if USE_ASYNCIO else threads}")
+    for chunk in iter_ips_chunked(path, chunk_size):
+        seen_total += len(chunk)
+        if USE_ASYNCIO:
+            passed = stage1_async(chunk, max(ASYNCIO_CONCURRENCY, threads), CURL_TIMEOUT_SEC)
+        else:
+            passed = _stage1_threaded(chunk, threads)
+        out.extend(passed)
+        del chunk, passed
+        rate = seen_total / max(0.001, time.time() - t0)
+        log(f"[*] 第一阶段进度：已测 {seen_total:,} 个，"
+            f"累计通过 {len(out):,} 个（{rate:.0f} 个/秒）")
+    log(f"[*] 第一阶段完成：{len(out)}/{seen_total}")
+    return out
+
+
 def stage1(items, threads):
+    """对一批候选跑第一阶段（内存里已有全部候选时用）。"""
     if USE_ASYNCIO:
         return stage1_async(items, max(ASYNCIO_CONCURRENCY, threads), CURL_TIMEOUT_SEC)
+    return _stage1_threaded(items, threads)
+
+
+def _stage1_threaded(items, threads):
     total = len(items)
     done = 0
     out = []
@@ -1599,6 +1679,9 @@ def main():
                    help="CSV输出路径（不做 {path}/{date}/{num} 等替换）")
     p.add_argument("-d", "--download-size", type=float, default=None,
                    help="测速文件大小（单位 MB），默认 20")
+    p.add_argument("-chunk-size", type=int, default=20000,
+                   help="流式第一阶段的批大小（默认 20000）。调小更省内存，"
+                        "调大吞吐略高；峰值内存只跟这个值有关。")
     p.add_argument("-skiptr", "--skiptr", action="store_true",
                    help="跳过 traceroute 线路分析")
     p.add_argument("-stage1", "--stage1-only", action="store_true",
@@ -1687,11 +1770,15 @@ def main():
     log(f"route_cache   = {ROUTE_CACHE_FILE}（已加载 {n_cache} 条）")
     log("=" * 60)
 
-    items = load_ips(DEFAULT_INPUT)
-    if not items:
+    # 流式：不再先把 18 万个候选全读进内存，而是边读边测
+    total_candidates = count_ips(DEFAULT_INPUT)
+    if not total_candidates:
+        log("[!] 没有候选 IP")
         return
+    log(f"[*] 加载 {total_candidates} 个唯一IP（流式）")
 
-    available = stage1(items, threads)
+    available = stage1_streaming(DEFAULT_INPUT, threads,
+                                 max(500, a.chunk_size))
     if not available:
         log("[!] 无可用IP")
         return

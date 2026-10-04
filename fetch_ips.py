@@ -261,7 +261,7 @@ def apply_config(cfg):
     global ASNS, ASN_SAMPLE, ASN_REGIONS, ASN_EXCLUDE_REGIONS
     global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
     global THREADS, LOOP
-    global OUTPUT_REGIONS, OUTPUT_SPLIT
+    global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE
 
     get = cfg.get
     if "FOFA_API_BASE" in cfg:        FOFA_API_BASE = str(get("FOFA_API_BASE")).strip() or FOFA_API_BASE
@@ -306,6 +306,7 @@ def apply_config(cfg):
     if "NOTIFY_ONLY_WITH_RESULT" in cfg:
         NOTIFY_ONLY_WITH_RESULT = as_bool(get("NOTIFY_ONLY_WITH_RESULT"), NOTIFY_ONLY_WITH_RESULT)
     if "PORTS" in cfg:                PORTS = str(get("PORTS") or "").strip()
+    if "CHUNK_SIZE" in cfg:          CHUNK_SIZE = as_int(get("CHUNK_SIZE"), CHUNK_SIZE)
     if "OUTPUT_REGIONS" in cfg:
         OUTPUT_REGIONS = str(get("OUTPUT_REGIONS") or "").strip().strip('"')
     if "OUTPUT_SPLIT" in cfg:         OUTPUT_SPLIT = as_bool(get("OUTPUT_SPLIT"), OUTPUT_SPLIT)
@@ -911,6 +912,7 @@ PORTS = "443"
 # fetch_ips.py 用它算出地区版文件名后缀，好在读结果时把地区版 CSV 排除掉
 # （不排除的话，地区版是后写的、mtime 更新，会被当成主结果读出来）。
 OUTPUT_REGIONS = "HK,JP,SG,KR,TW"
+CHUNK_SIZE = 20000
 OUTPUT_SPLIT = True
 
 # 扫描线程数与循环间隔也放进配置，这样 Web 面板能直接控制，
@@ -2410,6 +2412,8 @@ def main():
         extra_run_args += ["-d", "5"]
     if "-log" not in extra_run_args:
         extra_run_args += ["-log", "-quiet"]
+    if "-chunk-size" not in extra_run_args and CHUNK_SIZE:
+        extra_run_args += ["-chunk-size", str(CHUNK_SIZE)]
 
     source = a.source
     if source == "auto":
