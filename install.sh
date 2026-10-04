@@ -154,12 +154,21 @@ elif command -v git >/dev/null 2>&1 && git clone --depth 1 "$REPO_URL" "$INSTALL
   ok "git clone 完成"
 else
   warn "git 不可用或仓库不可访问，改用 tarball 下载"
-  TARBALL="${REPO_URL%.git}/archive/refs/heads/main.tar.gz"
+  # 加时间戳防缓存：ghproxy 之类的镜像会缓存旧版本，实测踩过 ——
+  # 明明推送了新代码，镜像还在发几天前的旧文件，导致「更新了却没生效」。
+  TS=$(date +%s)
+  TARBALL="${REPO_URL%.git}/archive/refs/heads/main.tar.gz?t=$TS"
   mkdir -p "$INSTALL_DIR"
   if curl -fsSL "$TARBALL" | tar -xz -C "$INSTALL_DIR" --strip-components=1; then
     ok "tarball 下载完成"
   else
-    die "代码下载失败。请检查网络，或手动把项目文件放到 ${INSTALL_DIR}"
+    # 再试一次：换 ghproxy 镜像（同样带防缓存）
+    TARBALL2="https://ghproxy.net/${REPO_URL%.git}/archive/refs/heads/main.tar.gz?t=$TS"
+    if curl -fsSL "$TARBALL2" | tar -xz -C "$INSTALL_DIR" --strip-components=1; then
+      ok "tarball 下载完成（经 ghproxy 镜像）"
+    else
+      die "代码下载失败。请检查网络，或手动把项目文件放到 ${INSTALL_DIR}"
+    fi
   fi
 fi
 [ -f "$INSTALL_DIR/fetch_ips.py" ] || die "${INSTALL_DIR} 里没有 fetch_ips.py，代码不完整"
