@@ -56,12 +56,19 @@ def test_globals_declared():
                             out.add(sub.id)
         return out
 
-    for fn in ("apply_config", "apply_env", "main"):
-        declared = globals_of(fn)
-        need = assigned_globals(fn)
-        missing = need - declared
-        check(f"{fn}() 的 global 声明完整", not missing,
-              f"缺: {sorted(missing)}")
+    # 检查【所有】函数，不再硬编码函数名 ——
+    # 之前只查 apply_config/apply_env/main，结果 apply_cli 漏了 FULL_SCAN，
+    # 赋值变成了局部变量，功能静默失效（踩了不止一次）。
+    all_fns = [n.name for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    bad = {}
+    for fn in all_fns:
+        missing = assigned_globals(fn) - globals_of(fn)
+        # 排除函数自己的参数和局部变量（赋值前没在模块级定义的不算）
+        if missing:
+            bad[fn] = sorted(missing)
+    check("所有函数的 global 声明完整", not bad,
+          f"这些函数里给模块级变量赋值却没声明 global: {bad}")
 
 
 # ---------------------------------------------------------------- 2. 全量扫描

@@ -325,6 +325,7 @@ def apply_config(cfg):
     global OUTPUT_REGIONS, OUTPUT_SPLIT
     global USE_NATIVE_SOCKET
     global USE_ASYNCIO, ASYNCIO_CONCURRENCY
+    global STAGE0_ENABLED, STAGE0_TIMEOUT, STAGE0_CONCURRENCY
     global DEFAULT_INPUT, DEFAULT_IP_OUTPUT, DEFAULT_CSV_OUTPUT, OUTPUT_FOLDER_PATH
     global DEFAULT_THREADS, MAX_IO_THREADS, DEFAULT_SPEED_WORKERS
     global SPEED_TEST_URL, AVAILABILITY_URL, AVAILABILITY_HOST
@@ -364,6 +365,12 @@ def apply_config(cfg):
         USE_NATIVE_SOCKET = bool(cfg["USE_NATIVE_SOCKET"])
     if "USE_ASYNCIO" in cfg:
         USE_ASYNCIO = bool(cfg["USE_ASYNCIO"])
+    if "STAGE0_ENABLED" in cfg:
+        STAGE0_ENABLED = bool(cfg["STAGE0_ENABLED"])
+    if "STAGE0_TIMEOUT" in cfg:
+        STAGE0_TIMEOUT = float(cfg["STAGE0_TIMEOUT"])
+    if "STAGE0_CONCURRENCY" in cfg:
+        STAGE0_CONCURRENCY = max(1, int(cfg["STAGE0_CONCURRENCY"]))
     if "ASYNCIO_CONCURRENCY" in cfg:
         ASYNCIO_CONCURRENCY = max(1, int(cfg["ASYNCIO_CONCURRENCY"]))
     if "DEFAULT_INPUT" in cfg:
@@ -834,6 +841,75 @@ def submit_batched(ex, fn, items, batch=TASK_BATCH):
         del fmap
 
 
+# ==================== stage0：快速 TCP 预筛 ====================
+# 为什么需要这一级：
+#   实测随机云厂商 IP 里 90% 是黑洞（发 SYN 完全无响应），只能干等超时。
+#   4650 万个 IP（vps 档位全量 = 18.2 万 /24 × 254）按 4 秒超时、800 并发算，
+#   光等黑洞就要 58 小时。
+#
+#   stage0 只做一件事：TCP 三次握手，成功就放行。不做 TLS、不发请求，
+#   所以单次开销极小，超时可以压到 1.5 秒，并发可以开到几千。
+#   黑洞被快速筛掉，后面的 TLS+trace 只作用在真正活着的 IP 上。
+#
+# 代价：只连 TCP 不能判断是不是反代，所以它只是「预筛」不是「筛选」——
+# 端口开着但不是反代的 IP 依然会被 stage1 淘汰，只是不用在 stage0 就淘汰。
+STAGE0_ENABLED = True
+STAGE0_TIMEOUT = 1.5        # 秒。黑洞靠这个值淘汰，调小更快但可能误杀慢线路
+STAGE0_CONCURRENCY = 3000   # 纯 TCP 连接很轻，可以比 stage1 开得高得多
+
+
+async def _tcp_probe(addr, port, sem, timeout):
+    """只做 TCP 连接，成功返回 True。"""
+    import asyncio
+    async with sem:
+        w = None
+        try:
+            r, w = await asyncio.wait_for(
+                asyncio.open_connection(addr, int(port or 443)), timeout)
+            return True
+        except (OSError, asyncio.TimeoutError, ValueError):
+            return False
+        finally:
+            if w is not None:
+                try:
+                    w.close()
+                except OSError:
+                    pass
+
+
+def stage0_tcp_filter(items, timeout=STAGE0_TIMEOUT, concurrency=STAGE0_CONCURRENCY):
+    """快速 TCP 预筛：只留下端口真的开着的。"""
+    import asyncio
+
+    total = len(items)
+    log(f"\n[*] stage0 预筛：TCP 连通性，{total} IP，"
+        f"并发 {concurrency}，超时 {timeout}s")
+    BATCH = max(concurrency * 4, 2000)
+    out = []
+    done = 0
+
+    async def _run():
+        nonlocal done
+        for start in range(0, total, BATCH):
+            chunk = items[start:start + BATCH]
+            sem = asyncio.Semaphore(concurrency)
+            res = await asyncio.gather(*[
+                _tcp_probe(x["ip"], str(x.get("port") or "443"), sem, timeout)
+                for x in chunk])
+            for x, ok in zip(chunk, res):
+                done += 1
+                if ok:
+                    out.append(x)
+                if done % max(1, BATCH // 4) == 0 or done == total:
+                    progress("s0", done, total,
+                             f"{x['ip']} | {'open' if ok else 'blackhole'}")
+
+    asyncio.run(_run())
+    log(f"[*] stage0 完成：{len(out)}/{total} 端口开着"
+        f"（筛掉 {total - len(out)} 个黑洞/拒绝，省下后面的 TLS 开销）")
+    return out
+
+
 # ==================== asyncio 版可用性检查 ====================
 # 为什么单核 VPS 上 asyncio 明显更快：
 #   线程池版每个在飞的请求占一个 OS 线程。1 核上开 500 个线程，
@@ -1110,6 +1186,13 @@ def stage1_streaming(path, threads, chunk_size=20000):
         f"{max(ASYNCIO_CONCURRENCY, threads) if USE_ASYNCIO else threads}")
     for chunk in iter_ips_chunked(path, chunk_size):
         seen_total += len(chunk)
+        # stage0：先把黑洞筛掉，后面的 TLS 只作用在活着的 IP 上
+        if STAGE0_ENABLED:
+            before = len(chunk)
+            chunk = stage0_tcp_filter(chunk, STAGE0_TIMEOUT, STAGE0_CONCURRENCY)
+            if not chunk:
+                log(f"[*] 本批 {before} 个全被 stage0 筛掉，跳过 TLS 阶段")
+                continue
         if USE_ASYNCIO:
             passed = stage1_async(chunk, max(ASYNCIO_CONCURRENCY, threads), CURL_TIMEOUT_SEC)
         else:

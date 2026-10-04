@@ -261,7 +261,7 @@ def apply_config(cfg):
     global ASNS, ASN_SAMPLE, ASN_REGIONS, ASN_EXCLUDE_REGIONS
     global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
     global THREADS, LOOP
-    global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE
+    global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE, FULL_SCAN
 
     get = cfg.get
     if "FOFA_API_BASE" in cfg:        FOFA_API_BASE = str(get("FOFA_API_BASE")).strip() or FOFA_API_BASE
@@ -307,6 +307,7 @@ def apply_config(cfg):
         NOTIFY_ONLY_WITH_RESULT = as_bool(get("NOTIFY_ONLY_WITH_RESULT"), NOTIFY_ONLY_WITH_RESULT)
     if "PORTS" in cfg:                PORTS = str(get("PORTS") or "").strip()
     if "CHUNK_SIZE" in cfg:          CHUNK_SIZE = as_int(get("CHUNK_SIZE"), CHUNK_SIZE)
+    if "FULL_SCAN" in cfg:            FULL_SCAN = as_bool(get("FULL_SCAN"), FULL_SCAN)
     if "OUTPUT_REGIONS" in cfg:
         OUTPUT_REGIONS = str(get("OUTPUT_REGIONS") or "").strip().strip('"')
     if "OUTPUT_SPLIT" in cfg:         OUTPUT_SPLIT = as_bool(get("OUTPUT_SPLIT"), OUTPUT_SPLIT)
@@ -913,6 +914,13 @@ PORTS = "443"
 # （不排除的话，地区版是后写的、mtime 更新，会被当成主结果读出来）。
 OUTPUT_REGIONS = "HK,JP,SG,KR,TW"
 CHUNK_SIZE = 20000
+
+# ==================== 全量扫描 ====================
+# 每个 /24 是 254 个独立主机（unicast），不是 anycast。
+# 抽样 1 个 /24 只能发现 1/254 的反代 —— 实测密度约 0.066%，
+# 抽样 18.2 万 IP 只能找到约 120 个反代，全量 4650 万 IP 能找到约 3 万个。
+# 代价是每轮约 50 小时（stage0 预筛后），适合 24 小时常驻的 VPS。
+FULL_SCAN = False          # true = 每个 /24 的 254 个地址全测
 OUTPUT_SPLIT = True
 
 # 扫描线程数与循环间隔也放进配置，这样 Web 面板能直接控制，
@@ -1986,11 +1994,20 @@ def iter_asn_candidates(asns, sample, timeout, retries, debug=False, stats=None)
                             addrs.append(int(n.network_address))
                 del nets
                 for base in addrs:
-                    picked_total += 1
-                    yield {"ip": str(ipaddress.IPv4Address(base + random.randint(1, 254))),
-                           "port": "443", "protocol": "https", "country": ""}
+                    if FULL_SCAN:
+                        # 全量：这个 /24 的 254 个可用地址（跳过 .0 / .255）全产出
+                        for host in range(1, 255):
+                            picked_total += 1
+                            yield {"ip": str(ipaddress.IPv4Address(base + host)),
+                                   "port": "443", "protocol": "https", "country": ""}
+                    else:
+                        picked_total += 1
+                        yield {"ip": str(ipaddress.IPv4Address(base + random.randint(1, 254))),
+                               "port": "443", "protocol": "https", "country": ""}
                 del addrs
-        log(f"[*] 采样完成，共 {picked_total:,} 个候选地址")
+        log(f"[*] {'全量展开' if FULL_SCAN else '采样'}完成，"
+        f"共 {picked_total:,} 个候选地址"
+        + ("（每个 /24 全部 254 个地址）" if FULL_SCAN else ""))
         if stats is not None:
             stats["asns"] = len([a for a, c in counts.items() if c > 0])
     finally:
@@ -2274,6 +2291,7 @@ def apply_cli(a, quiet_banner=False):
     global FOFA_QUERY_TEMPLATE, FOFA_MAX_PER_REGION, FOFA_FIELDS, DEBUG, IPDB_TYPES
     global IPDB_CF_SAMPLE, LIST_URLS, LIST_REGIONS, ASNS, ASN_SAMPLE, ASN_REGIONS
     global ASN_EXCLUDE_REGIONS, NOTIFY_CHANNEL, NOTIFY_TARGET, PORTS, THREADS, LOOP
+    global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE, FULL_SCAN
 
     if a.debug:
         DEBUG = True
@@ -2314,6 +2332,8 @@ def apply_cli(a, quiet_banner=False):
         ASN_EXCLUDE_REGIONS = a.asn_exclude_regions.strip()
     if a.ports is not None:
         PORTS = a.ports.strip()
+    if getattr(a, "full_scan", False):
+        FULL_SCAN = True
     if a.cf_sample is not None:
         IPDB_CF_SAMPLE = max(0, a.cf_sample)
         if IPDB_CF_SAMPLE > 200 and not quiet_banner:
@@ -2356,6 +2376,10 @@ def main():
     p.add_argument("-once", action="store_true",
                    help="只跑一轮就退出（忽略配置里的 LOOP）。"
                         "Web 面板的「立即跑一轮」和定时任务用这个。")
+    p.add_argument("-full-scan", action="store_true",
+                   help="每个 /24 的 254 个地址全部测（而不是只抽 1 个）。"
+                        "反代是 unicast、每个 IP 独立，抽样会漏掉 254/255。"
+                        "代价：vps 档位一轮约 50 小时")
     p.add_argument("-ports", default=None,
                    help=f"测哪些端口，逗号分隔。CF 的 HTTPS 端口是 "
                         f"443,2053,2083,2087,2096,8443。默认 '{PORTS}'，空=不限制。"
