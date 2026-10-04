@@ -201,12 +201,67 @@ def test_files_ok():
           r.stderr.decode("utf-8", "replace")[:200])
 
 
+# ---------------------------------------------------------------- 7. Web 面板
+def test_webui():
+    """面板曾经因为 status.json 带 BOM 而静默显示空白（异常被 except 吞掉）。
+    另外推送设置要能存能读。"""
+    import json
+    import webui
+
+    OUT = os.path.join(ROOT, "output")
+    os.makedirs(OUT, exist_ok=True)
+    sf = webui.STATUS_FILE
+
+    # 带 BOM 的 status.json 必须能读
+    with open(sf, "w", encoding="utf-8-sig") as f:
+        json.dump({"stage_name": "第一阶段 · 可用性检查", "stage_done": 5,
+                   "stage_total": 10, "progress_pct": 50.0}, f, ensure_ascii=False)
+    st = webui.load_status()
+    check("带 BOM 的 status.json 能读", st.get("stage_name") == "第一阶段 · 可用性检查",
+          f"实际 {st.get('stage_name')!r}")
+    check("进度字段正确", st.get("progress_pct") == 50.0)
+
+    # 不带 BOM 也要能读
+    with open(sf, "w", encoding="utf-8") as f:
+        json.dump({"stage_name": "无BOM"}, f, ensure_ascii=False)
+    check("不带 BOM 的 status.json 能读", webui.load_status().get("stage_name") == "无BOM")
+
+    # 坏 JSON 不能崩
+    with open(sf, "w", encoding="utf-8") as f:
+        f.write("{ 这不是 json")
+    check("坏 JSON 不抛异常", isinstance(webui.load_status(), dict))
+
+    os.remove(sf)
+
+    # 推送设置：存 -> 读 往返
+    orig = open(webui.CONFIG_PATH, encoding="utf-8").read()
+    try:
+        ok, msg = webui.save_notify_settings("ntfy", "https://ntfy.sh/regression-test", True)
+        check("推送设置能保存", ok, msg)
+        s = webui.load_notify_settings()
+        check("保存后能读回渠道", s["channel"] == "ntfy", f"实际 {s['channel']!r}")
+        check("保存后能读回目标", s["target"] == "https://ntfy.sh/regression-test")
+        check("configured 标记正确", s["configured"] is True)
+        check("渠道列表非空", len(s["channels"]) >= 9)
+        # 保存不能破坏其它配置
+        import ip as _ip
+        cfg = _ip.load_config(webui.CONFIG_PATH)
+        check("其它配置未被破坏", cfg.get("DEFAULT_THREADS") == 20
+              and cfg.get("token") is not None)
+    finally:
+        open(webui.CONFIG_PATH, "w", encoding="utf-8").write(orig)
+
+    # 预览能渲染
+    p = webui.notify_preview()
+    check("推送预览可渲染", p.get("ok") is True and "轮" in p.get("title", ""))
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  回归测试")
     print("=" * 62)
     for fn in (test_globals_declared, test_full_scan, test_cleanup,
-               test_multiport, test_notify_summary, test_files_ok):
+               test_multiport, test_notify_summary, test_files_ok, test_webui):
         print(f"\n[{fn.__name__}] {fn.__doc__.splitlines()[0] if fn.__doc__ else ''}")
         try:
             fn()

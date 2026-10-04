@@ -889,6 +889,9 @@ NOTIFY_ONLY_WITH_RESULT = True  # 没有可用 IP 时不推送（免得白刷屏
 # 留空字符串表示不限制（列表源里是什么端口就测什么）。
 PORTS = "443"
 
+# 进度上报节流用（避免把 status.json 刷爆）
+_prog_last = {}
+
 def asn_prefixes(asn, timeout, retries, debug=False):
     """查一个 ASN 宣告的 IPv4 网段，返回 ipaddress 网络对象列表。"""
     asn = str(asn).strip().upper()
@@ -922,7 +925,8 @@ def asn_fetch(asns, sample, timeout, retries, debug=False):
     """
     stats = {"asns": 0, "failed": 0, "subnets": 0}
     nets24 = []
-    for asn in asns:
+    for idx, asn in enumerate(asns, 1):
+        set_progress("asn", idx, len(asns), f"抓取阶段 · 查询 ASN 网段（{asn}）")
         try:
             nets = asn_prefixes(asn, timeout, retries, debug)
         except FetchError as e:
@@ -999,6 +1003,8 @@ def geo_tag(rows, timeout=30, debug=False):
                 tagged += 1
         if i + GEO_BATCH < len(ips):
             time.sleep(4.5)                          # 15 请求/分钟 → 每 4.5s 一批
+        set_progress("geo", min(i + GEO_BATCH, len(ips)), len(ips),
+                     "抓取阶段 · 地区标注（ip-api）")
     if debug:
         log(f"[DEBUG] 地区标注成功 {tagged}/{len(ips)}")
     return tagged
@@ -1391,13 +1397,31 @@ def run_tester(csv_path, extra_args):
         return 1, None, None
 
     for line in p.stdout:
-        print(line.rstrip("\n"), flush=True)
+        line = line.rstrip("\n")
+        print(line, flush=True)
         m = re.search(r"第一阶段完成：(\d+)/(\d+)", line)
         if m:
             avail = (int(m.group(1)), int(m.group(2)))
         m = re.search(r"第二阶段完成：(\d+)/(\d+)", line)
         if m:
             qual = (int(m.group(1)), int(m.group(2)))
+
+        # ---- 实时上报进度给 Web 面板 ----
+        # 形如：12:34:56 [availability 150/300] 1.2.3.4 | PASS ...
+        m = re.search(r"\[(\w+) (\d+)/(\d+)\]", line)
+        if m:
+            stage, done, total = m.group(1), int(m.group(2)), int(m.group(3))
+            now = time.time()
+            # 节流：每 3 秒或最后一条才写一次，别把磁盘刷爆
+            if done == total or now - _prog_last.get("t", 0) > 3:
+                _prog_last["t"] = now
+                names = {"availability": "第一阶段 · 可用性检查",
+                         "speed/latency": "第二阶段 · 延迟与测速",
+                         "traceroute": "第三阶段 · 线路分析"}
+                set_progress(stage, done, total, names.get(stage, stage),
+                             {"last_line": line[:160]})
+        elif line.startswith("[*]") or "阶段" in line:
+            write_status(last_line=line[:160])
     p.wait()
     return p.returncode, avail, qual
 
@@ -1561,6 +1585,23 @@ def disk_guard():
             log("    - 确认 ip.py 带了 -quiet（逐条进度日志是磁盘杀手）")
             log("    - 调小 config.ini 的 LOG_MAX_BYTES")
     return free
+
+
+def set_progress(stage, done=None, total=None, name="", extra=None):
+    """上报当前进度给 Web 面板（写进 status.json）。
+
+    写文件比内存共享慢，所以调用方要自己节流；这里只负责拼字段。
+    """
+    d = {"phase": "running", "stage": stage, "stage_name": name or stage}
+    if done is not None:
+        d["stage_done"] = done
+    if total is not None:
+        d["stage_total"] = total
+    if done is not None and total:
+        d["progress_pct"] = round(done * 100.0 / total, 1)
+    if extra:
+        d.update(extra)
+    write_status(**d)
 
 
 # ==================== 状态文件（给 Web UI 读） ====================

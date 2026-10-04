@@ -44,9 +44,12 @@ def load_status():
     st = {}
     if os.path.exists(STATUS_FILE):
         try:
-            with open(STATUS_FILE, "r", encoding="utf-8") as f:
+            # 用 utf-8-sig：带不带 BOM 都能读。
+            # 用纯 utf-8 的话，一旦文件带 BOM 就会抛 JSONDecodeError，
+            # 被下面的 except 吞掉，面板静默显示空白 —— 这个坑踩过。
+            with open(STATUS_FILE, "r", encoding="utf-8-sig") as f:
                 st = json.load(f) or {}
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             st = {}
     # 判断扫描进程是否还活着
     pid = st.get("pid")
@@ -93,7 +96,7 @@ def tail_log(lines=200):
     if not best:
         return []
     try:
-        with open(best, "r", encoding="utf-8", errors="replace") as f:
+        with open(best, "r", encoding="utf-8-sig", errors="replace") as f:
             return f.read().splitlines()[-lines:]
     except OSError:
         return []
@@ -222,6 +225,101 @@ def serve_ips(qs):
     return "\n".join(r["ip"] for r in out) + ("\n" if out else "")
 
 
+CHANNELS = [
+    ("bark", "iOS · Bark App", "https://api.day.app/你的key"),
+    ("ntfy", "全平台 / 可自建", "https://ntfy.sh/你的topic"),
+    ("pushdeer", "开源 iOS/Android", "https://api2.pushdeer.com"),
+    ("serverchan", "Server酱³（微信）", "https://sctapi.ftqq.com/你的key.send"),
+    ("telegram", "Telegram Bot", "<bot_token>|<chat_id>"),
+    ("wecom", "企业微信群机器人", "webhook 完整地址"),
+    ("dingtalk", "钉钉群机器人", "webhook 完整地址"),
+    ("feishu", "飞书群机器人", "webhook 完整地址"),
+    ("webhook", "通用 POST JSON", "你的地址"),
+]
+
+CONFIG_PATH = os.path.join(HERE, "config.ini")
+
+
+def _mask(s, keep=26):
+    s = str(s or "")
+    return s if len(s) <= keep else s[:keep] + "…"
+
+
+def load_notify_settings():
+    """从 config.ini 读推送配置。"""
+    out = {"channel": "", "target": "", "target_masked": "",
+           "only_with_result": True, "configured": False, "channels": CHANNELS}
+    try:
+        import ip as _ip
+        cfg = _ip.load_config(CONFIG_PATH)
+        out["channel"] = str(cfg.get("NOTIFY_CHANNEL") or "").strip()
+        out["target"] = str(cfg.get("NOTIFY_TARGET") or "").strip()
+        out["only_with_result"] = bool(cfg.get("NOTIFY_ONLY_WITH_RESULT", True))
+    except Exception as e:                       # noqa: BLE001
+        out["error"] = str(e)
+    out["target_masked"] = _mask(out["target"])
+    out["configured"] = bool(out["channel"] and out["target"])
+    return out
+
+
+def save_notify_settings(channel, target, only_with_result=True):
+    """把推送配置写回 config.ini（只动 NOTIFY_* 三个键）。"""
+    import re as _re
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            txt = f.read()
+    except OSError as e:
+        return False, f"读不到 config.ini: {e}"
+
+    def setkey(t, k, v):
+        pat = _re.compile(rf"^{_re.escape(k)}\s*=.*$", _re.M)
+        line = f"{k} = {v}"
+        return pat.sub(lambda _m: line, t, count=1) if pat.search(t) else t + f"\n{line}\n"
+
+    txt = setkey(txt, "NOTIFY_CHANNEL", f'"{channel}"')
+    txt = setkey(txt, "NOTIFY_TARGET", f'"{target}"')
+    txt = setkey(txt, "NOTIFY_ONLY_WITH_RESULT", "true" if only_with_result else "false")
+    try:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(txt)
+        os.replace(tmp, CONFIG_PATH)
+    except OSError as e:
+        return False, f"写 config.ini 失败: {e}"
+    return True, "已保存（下一轮生效）"
+
+
+def notify_preview():
+    """渲染推送正文预览（用当前最新结果）。"""
+    try:
+        import notify as _n
+        res = load_results()
+        rows = res.get("rows") or []
+        st = load_status()
+        avail = st.get("available") or st.get("kept")
+        body = _n.build_summary(st.get("round") or 1, avail, len(rows), rows)
+        head = f"第 {st.get('round') or 1} 轮完成"
+        return {"ok": True, "title": f"CF 反代 IP · {head}",
+                "body": body, "rows": len(rows)}
+    except Exception as e:                       # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
+def notify_test(channel=None, target=None):
+    """发一条测试推送。不传就用 config.ini 里的。"""
+    try:
+        import notify as _n
+        st = load_notify_settings()
+        _n.NOTIFY_CHANNEL = (channel or st["channel"]).strip()
+        _n.NOTIFY_TARGET = (target or st["target"]).strip()
+        if not _n.NOTIFY_CHANNEL or not _n.NOTIFY_TARGET:
+            return {"ok": False, "msg": "渠道或目标为空，先在下面填好再测"}
+        ok, msg = _n.self_test()
+        return {"ok": ok, "msg": msg, "channel": _n.NOTIFY_CHANNEL}
+    except Exception as e:                       # noqa: BLE001
+        return {"ok": False, "msg": str(e)}
+
+
 # ==================== 页面 ====================
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN"><head>
@@ -233,9 +331,10 @@ PAGE = r"""<!DOCTYPE html>
  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif}
  .wrap{max-width:1180px;margin:0 auto;padding:20px}
  h1{font-size:19px;margin:0 0 4px}
- .sub{color:var(--dim);font-size:12px;margin-bottom:18px}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:18px}
- .card{background:var(--card);border:1px solid #232733;border-radius:10px;padding:14px}
+ h2{font-size:15px;margin:0 0 12px;color:var(--fg)}
+ .sub{color:var(--dim);font-size:12px;margin-bottom:16px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+ .card{background:var(--card);border:1px solid #232733;border-radius:10px;padding:14px;margin-bottom:16px}
  .k{color:var(--dim);font-size:12px;margin-bottom:6px}
  .v{font-size:20px;font-weight:600;word-break:break-all}
  .v.sm{font-size:14px;font-weight:400}
@@ -243,43 +342,90 @@ PAGE = r"""<!DOCTYPE html>
  th,td{padding:7px 9px;text-align:left;border-bottom:1px solid #232733;white-space:nowrap}
  th{color:var(--dim);font-weight:500;position:sticky;top:0;background:var(--card)}
  tr:hover td{background:#1e222b}
- .scroll{max-height:440px;overflow:auto;border-radius:8px}
- pre{background:#12141a;border:1px solid #232733;border-radius:8px;padding:12px;overflow:auto;max-height:320px;font-size:12px;color:#b9c1d4}
- button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:9px 16px;font-size:14px;cursor:pointer}
+ .scroll{max-height:420px;overflow:auto;border-radius:8px}
+ pre{background:#12141a;border:1px solid #232733;border-radius:8px;padding:12px;overflow:auto;max-height:300px;font-size:12px;color:#b9c1d4;white-space:pre-wrap;word-break:break-all}
+ button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer}
  button:disabled{opacity:.5;cursor:default}
  button.gray{background:#2a2f3c}
+ button.sm{padding:5px 11px;font-size:12px}
+ input,select{background:#12141a;border:1px solid #2b3040;color:var(--fg);border-radius:7px;padding:7px 10px;font-size:13px;font-family:inherit}
+ input{flex:1;min-width:200px}
  .pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px}
  .on{background:rgba(61,220,132,.15);color:var(--ok)}
  .off{background:rgba(255,92,92,.15);color:var(--bad)}
  .idle{background:rgba(255,176,32,.15);color:var(--warn)}
  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+ .bar{height:9px;background:#12141a;border-radius:99px;overflow:hidden;margin-top:8px;border:1px solid #232733}
+ .bar>i{display:block;height:100%;background:linear-gradient(90deg,#4c8dff,#3ddc84);width:0;transition:width .4s}
  .err{color:var(--bad)}
+ .ok{color:var(--ok)}
+ .hint{color:var(--dim);font-size:12px;margin-top:6px}
+ .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+ @media(max-width:760px){.two{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
 <h1>Cloudflare 反代 IP 优选 · 控制台</h1>
 <div class="sub" id="sub">加载中…</div>
 
-<div class="row">
-  <button id="run">立即跑一轮</button>
-  <button class="gray" id="refresh">刷新</button>
-  <span id="runmsg" class="sub" style="margin:0"></span>
+<div class="card">
+  <div class="row" style="margin:0 0 8px">
+    <button id="run">立即跑一轮</button>
+    <button class="gray" id="refresh">刷新</button>
+    <span id="runmsg" class="sub" style="margin:0"></span>
+  </div>
+  <div class="k" id="stageName">当前阶段：—</div>
+  <div class="bar"><i id="bar"></i></div>
+  <div class="hint" id="stageInfo">—</div>
 </div>
 
 <div class="grid" id="stats"></div>
 
-<div class="card" style="margin-bottom:18px">
-  <div class="k">优选结果（按 延迟+丢包 综合评分排序）</div>
+<div class="card">
+  <h2>优选结果 <span class="k" id="resCount"></span></h2>
   <div class="scroll"><table id="res"><thead><tr>
-    <th>#</th><th>IP</th><th>评分</th><th>延迟</th><th>丢包</th><th>速度</th><th>线路</th><th>地区</th><th>城市</th>
+    <th>#</th><th>IP</th><th>端口</th><th>评分</th><th>延迟</th><th>丢包</th><th>速度</th><th>线路</th><th>地区</th><th>城市</th>
   </tr></thead><tbody></tbody></table></div>
 </div>
 
-<div class="card" style="margin-bottom:18px">
-  <div class="k">ip.txt</div>
+<div class="two">
+  <div class="card">
+    <h2>推送设置</h2>
+    <div class="k">渠道</div>
+    <div class="row" style="margin-bottom:10px">
+      <select id="nch"></select>
+      <span id="nstate" class="sub" style="margin:0"></span>
+    </div>
+    <div class="k">目标（key / webhook 地址）</div>
+    <div class="row" style="margin-bottom:10px">
+      <input id="ntg" placeholder="https://api.day.app/你的key">
+    </div>
+    <div class="row" style="margin-bottom:6px">
+      <label class="sub" style="margin:0"><input type="checkbox" id="nonly" style="width:auto;min-width:0"> 没有可用 IP 时不推送</label>
+    </div>
+    <div class="row" style="margin:0">
+      <button id="nsave">保存</button>
+      <button class="gray sm" id="ntest">发测试推送</button>
+      <span id="nmsg" class="sub" style="margin:0"></span>
+    </div>
+    <div class="hint">保存后写入 config.ini，下一轮生效。测试会真的发到你手机。</div>
+  </div>
+
+  <div class="card">
+    <h2>推送内容预览</h2>
+    <div class="row" style="margin-bottom:8px">
+      <button class="gray sm" id="nprev">刷新预览</button>
+      <span class="k" id="prevTitle" style="margin:0"></span>
+    </div>
+    <pre id="prev">点「刷新预览」看下一轮会推什么</pre>
+  </div>
+</div>
+
+<div class="card">
+  <h2>ip.txt</h2>
   <pre id="iptxt">—</pre>
 </div>
 
 <div class="card">
-  <div class="k">日志（尾部）</div>
+  <h2>日志（尾部 200 行）</h2>
   <pre id="log">—</pre>
 </div>
 </div>
@@ -287,20 +433,29 @@ PAGE = r"""<!DOCTYPE html>
 const TOKEN = new URLSearchParams(location.search).get('token') || '';
 const q = TOKEN ? ('?token=' + encodeURIComponent(TOKEN)) : '';
 async function api(p, opt){ const r = await fetch(p + q, opt); return r.json(); }
-
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 async function refresh(){
   try{
     const st = await api('/api/status');
     const alive = st.alive;
-    const state = st.state || (alive ? 'running' : 'idle');
-    const badge = alive
-      ? `<span class="pill on">运行中</span>`
-      : `<span class="pill idle">空闲</span>`;
+    const badge = alive ? '<span class="pill on">运行中</span>'
+                        : '<span class="pill idle">空闲</span>';
     document.getElementById('sub').innerHTML =
-      badge + ` 状态 <b>${esc(state)}</b> · 第 <b>${esc(st.round||0)}</b> 轮 · ` +
-      `更新于 ${esc(st.updated||'—')}${st.age_sec!=null?`（${st.age_sec}s 前）`:''}`;
+      badge + ' 状态 <b>' + esc(st.state||'—') + '</b> · 第 <b>' + esc(st.round||0) +
+      '</b> 轮 · 更新于 ' + esc(st.updated||'—') +
+      (st.age_sec!=null ? '（' + st.age_sec + 's 前）' : '');
+
+    // 进度条
+    const pct = st.progress_pct;
+    document.getElementById('bar').style.width = (pct!=null?pct:0) + '%';
+    document.getElementById('stageName').textContent = '当前阶段：' + (st.stage_name || '—');
+    let info = '';
+    if (st.stage_done!=null && st.stage_total) info = st.stage_done + ' / ' + st.stage_total + '  (' + pct + '%)';
+    else if (st.last_line) info = st.last_line;
+    if (st.free_mb!=null) info += (info?'　·　':'') + '可用磁盘 ' + Math.round(st.free_mb) + ' MB';
+    document.getElementById('stageInfo').textContent = info || '—';
+
     const cards = [
       ['轮次', st.round||0],
       ['候选总数', (st.candidates||0).toLocaleString()],
@@ -310,38 +465,74 @@ async function refresh(){
       ['循环间隔', st.loop? st.loop+'s' : '单次'],
     ];
     document.getElementById('stats').innerHTML = cards.map(([k,v])=>
-      `<div class="card"><div class="k">${k}</div><div class="v sm">${esc(v)}</div></div>`).join('');
+      '<div class="card" style="margin:0"><div class="k">'+k+'</div><div class="v sm">'+esc(v)+'</div></div>').join('');
 
     const rs = await api('/api/results');
-    const tb = document.querySelector('#res tbody');
     const rows = rs.rows || [];
-    tb.innerHTML = rows.length ? rows.map((r,i)=>`<tr>
-      <td>${esc(r.rank||i+1)}</td><td>${esc(r.ip)}</td><td>${esc(r.score)}</td>
-      <td>${esc(r.latency)}</td><td>${esc(r.loss)}</td><td>${esc(r.speed)}</td>
-      <td>${esc(r.route)}</td><td>${esc(r.country)}</td><td>${esc(r.city)}</td></tr>`).join('')
-      : '<tr><td colspan="9" style="color:#8b93a7">还没有结果</td></tr>';
+    document.getElementById('resCount').textContent = '共 ' + rows.length + ' 个';
+    const tb = document.querySelector('#res tbody');
+    tb.innerHTML = rows.length ? rows.map((r,i)=>'<tr>'+
+      '<td>'+esc(r.rank||i+1)+'</td><td>'+esc(r.ip)+'</td><td>'+esc(r.port||'443')+'</td>'+
+      '<td>'+esc(r.score)+'</td><td>'+esc(r.latency)+'</td><td>'+esc(r.loss)+'</td>'+
+      '<td>'+esc(r.speed)+'</td><td>'+esc(r.route)+'</td><td>'+esc(r.country)+'</td>'+
+      '<td>'+esc(r.city)+'</td></tr>').join('')
+      : '<tr><td colspan="10" style="color:#8b93a7">还没有结果</td></tr>';
     document.getElementById('iptxt').textContent = (rs.ip_txt&&rs.ip_txt.length) ? rs.ip_txt.join('\n') : '—';
 
     const lg = await api('/api/log?lines=200');
     const pre = document.getElementById('log');
-    pre.textContent = (lg.lines&&lg.lines.length) ? lg.lines.join('\n') : '（还没有日志文件，加 -log 或跑一轮就会生成）';
+    pre.textContent = (lg.lines&&lg.lines.length) ? lg.lines.join('\n') : '（还没有日志文件，加 -log 就会生成）';
     pre.scrollTop = pre.scrollHeight;
   }catch(e){
     document.getElementById('sub').innerHTML = '<span class="err">连接失败：'+esc(e.message)+'</span>';
   }
 }
 
+async function loadNotify(){
+  try{
+    const n = await api('/api/notify');
+    const sel = document.getElementById('nch');
+    sel.innerHTML = '<option value="">（不推送）</option>' +
+      (n.channels||[]).map(([v,label,tip])=>'<option value="'+v+'">'+esc(label)+'</option>').join('');
+    sel.value = n.channel || '';
+    document.getElementById('ntg').value = n.target || '';
+    document.getElementById('nonly').checked = !!n.only_with_result;
+    document.getElementById('nstate').innerHTML = n.configured
+      ? '<span class="pill on">已配置</span>' : '<span class="pill idle">未配置</span>';
+  }catch(e){ document.getElementById('nstate').textContent = '读取失败'; }
+}
+
 document.getElementById('refresh').onclick = refresh;
+document.getElementById('nprev').onclick = async () => {
+  const p = await api('/api/notify/preview');
+  document.getElementById('prevTitle').textContent = p.ok ? (p.title + '  ·  ' + p.rows + ' 个 IP') : '';
+  document.getElementById('prev').textContent = p.ok ? p.body : ('生成失败：' + p.error);
+};
+document.getElementById('nsave').onclick = async () => {
+  const m = document.getElementById('nmsg'); m.textContent = '保存中…';
+  const r = await api('/api/notify', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({channel: document.getElementById('nch').value,
+                          target: document.getElementById('ntg').value,
+                          only_with_result: document.getElementById('nonly').checked})});
+  m.innerHTML = r.ok ? '<span class="ok">'+esc(r.msg)+'</span>' : '<span class="err">'+esc(r.msg)+'</span>';
+  loadNotify();
+};
+document.getElementById('ntest').onclick = async () => {
+  const m = document.getElementById('nmsg'); m.textContent = '发送中…';
+  const r = await api('/api/notify/test', {method:'POST'});
+  m.innerHTML = r.ok ? '<span class="ok">推送成功（'+esc(r.channel||'')+'）</span>'
+                     : '<span class="err">失败：'+esc(r.msg)+'</span>';
+};
 document.getElementById('run').onclick = async () => {
   const b = document.getElementById('run'); b.disabled = true;
   const m = document.getElementById('runmsg'); m.textContent = '正在启动…';
   try{
     const r = await api('/api/run', {method:'POST'});
-    m.textContent = r.ok ? ('已启动：' + (r.cmd||'')) : ('失败：' + (r.msg||''));
+    m.textContent = r.ok ? '已启动' : ('失败：' + (r.msg||''));
   }catch(e){ m.textContent = '失败：' + e.message; }
   setTimeout(()=>{ b.disabled = false; refresh(); }, 1500);
 };
-refresh(); setInterval(refresh, 5000);
+refresh(); loadNotify(); setInterval(refresh, 3000);
 </script></body></html>
 """
 
@@ -398,6 +589,10 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/log":
             n = int((qs.get("lines") or ["200"])[0])
             return self._json({"lines": tail_log(min(max(n, 10), 2000))})
+        if u.path == "/api/notify":
+            return self._json(load_notify_settings())
+        if u.path == "/api/notify/preview":
+            return self._json(notify_preview())
         return self._json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -407,6 +602,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "token 不正确"}, 401)
         if u.path == "/api/run":
             return self._json(spawn_run())
+        if u.path == "/api/notify/test":
+            return self._json(notify_test())
+        if u.path == "/api/notify":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                return self._json({"ok": False, "msg": f"请求体不是 JSON: {e}"}, 400)
+            ok, msg = save_notify_settings(
+                str(payload.get("channel") or "").strip(),
+                str(payload.get("target") or "").strip(),
+                bool(payload.get("only_with_result", True)))
+            return self._json({"ok": ok, "msg": msg})
         return self._json({"error": "not found"}, 404)
 
 
