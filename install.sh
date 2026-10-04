@@ -334,6 +334,9 @@ RestartSec=30
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
 NoNewPrivileges=true
+# 并发连接要占 fd。有些发行版 systemd 默认 DefaultLimitNOFILE=1024，
+# 那样 stage0 高并发时 socket 开不出来，会静默丢命中（实测丢 90%）。
+LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cfip
@@ -357,6 +360,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONIOENCODING=utf-8
 Environment=PYTHONUTF8=1
 ExecStart=/usr/bin/env python3 webui.py -host ${WEB_HOST} -port ${WEB_PORT} -token ${WEB_TOKEN} -run-args "-source asn -max 200 -run -- -threads 30 -d 3 -log -quiet"
+LimitNOFILE=65535
 Restart=always
 RestartSec=10
 StandardOutput=journal
