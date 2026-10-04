@@ -2156,6 +2156,65 @@ def read_final_summary(limit=200):
 # 峰值内存 = 单个 ASN 的候选数（最大约 12 万个，约 30MB）。
 
 
+# ==================== 断点续跑 ====================
+# vps 档位全量要跑 12 小时。用户的机器实测崩过 7 次（磁盘写满那次），
+# 一次意外重启就前功尽弃 —— 12 小时的扫描白跑。
+# 这里把「哪些 ASN 已经扫完」记到状态文件，重启后接着扫。
+#
+# 关键设计：
+#   - 状态里带一个【配置指纹】，配置变了（档位/全量/端口/ASN 列表不同）
+#     就当作新一轮，不续跑 —— 否则会拿旧配置的结果凑数。
+#   - 每扫完一个 ASN 就落一次状态，最多丢一个 ASN 的进度。
+#   - 续跑时用追加模式打开 stage1.csv.new，不重写已找到的结果。
+#   - 全部跑完才把 .new 提升成正式文件，并删掉状态。
+SCAN_STATE_FILE = "./output/scan_state.json"
+
+
+def _scan_state_path():
+    return SCAN_STATE_FILE if os.path.isabs(SCAN_STATE_FILE) else os.path.join(HERE, SCAN_STATE_FILE)
+
+
+def scan_fingerprint(asns, sample):
+    """这一轮扫描的配置指纹。变了就不续跑。"""
+    import hashlib
+    parts = [
+        "|".join(sorted(asns)),
+        str(sample),
+        str(FULL_SCAN),
+        str(PORTS),
+        str(SUB_BATCH),
+    ]
+    return hashlib.sha1("::".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def load_scan_state():
+    path = _scan_state_path()
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f) or {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+
+
+def save_scan_state(state):
+    path = _scan_state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as e:
+        log(f"[!] 写扫描状态失败：{e}")
+
+
+def clear_scan_state():
+    try:
+        os.remove(_scan_state_path())
+    except OSError:
+        pass
+
+
 def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
     """逐 ASN 完成「生成 -> 预筛 -> 可用性检查」，结果追加到 STAGE1_CSV。
 
@@ -2175,19 +2234,65 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
     # 本轮结果先写到 .new，全部跑完才原子替换 ——
     # 中途崩了不会把上一轮的结果覆盖掉（池子那边也会判 complete）。
     tmp_path = stage1_path + ".new"
-    found = 0
     seen_keys = set()
     asn_done = 0
     total_asns = len(asns)
     started = time.time()
 
+    # 上游模式只跑 stage0/stage1。把不跑的阶段标成「已跳过」，
+    # 否则面板上它们会永远停在「未开始」，看不出是没轮到还是压根不会跑。
+    if UPSTREAM_STAGE1_ONLY:
+        for _k, _n in (("s2", "stage2 · 延迟与测速（上游跳过，交给下游）"),
+                       ("s3", "stage3 · 线路分析（上游跳过，交给下游）")):
+            set_progress(_k, _n, 0, 0, extra={"skipped": True})
+    if len(as_list(PORTS)) <= 1 and (GEO_MAX and ASN_SAMPLE and ASN_SAMPLE > GEO_MAX):
+        set_progress("geo", "抓取 · 地区标注（地址太多，跳过）", 0, 0,
+                     extra={"skipped": True})
+
     log(f"\n[*] 逐 ASN 流水线：{total_asns} 个 ASN，"
         f"{'全量（每个 /24 的 254 个地址）' if FULL_SCAN else f'采样 {sample} 个 /24'}")
     log(f"    结果写入 {tmp_path}（跑完才替换正式文件）")
 
-    with open(tmp_path, "w", encoding="utf-8-sig", newline="") as fh:
+    # ---- 断点续跑：看有没有上一轮的进度 ----
+    fp = scan_fingerprint(asns, sample)
+    state = load_scan_state()
+    done_asns = set()
+    if state.get("fingerprint") == fp and os.path.exists(tmp_path):
+        done_asns = set(state.get("done") or [])
+        if done_asns:
+            log(f"[*] 发现上次的进度：已完成 {len(done_asns)}/{total_asns} 个 ASN，"
+                f"从断点继续（配置没变）")
+    elif state.get("fingerprint") and state.get("fingerprint") != fp:
+        log("[*] 配置变了（档位/全量/端口/ASN 列表不同），当作新一轮重新扫")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        clear_scan_state()
+
+    asns_todo = [a for a in asns if a not in done_asns]
+    if not asns_todo:
+        log("[*] 所有 ASN 都已扫完，直接进入收尾")
+    else:
+        log(f"[*] 本轮要扫 {len(asns_todo)} 个 ASN（跳过已完成的 {len(done_asns)} 个）")
+
+    # 续跑用追加模式；新开一轮用写模式（并写表头）
+    resuming = bool(done_asns) and os.path.exists(tmp_path)
+    mode = "a" if resuming else "w"
+    found = 0
+    if resuming:
+        # 数一下已有的结果条数
+        try:
+            with open(tmp_path, "r", encoding="utf-8-sig") as f:
+                found = max(0, sum(1 for _ in f) - 1)
+            log(f"[*] 已有 {found} 个反代记录，继续追加")
+        except OSError:
+            found = 0
+
+    with open(tmp_path, mode, encoding="utf-8-sig", newline="") as fh:
         wr = csv.writer(fh)
-        wr.writerow(["ip", "port", "protocol", "cfcountry", "colo"])
+        if not resuming:
+            wr.writerow(["ip", "port", "protocol", "cfcountry", "colo"])
 
         last_asn = None
         for asn, cands in iter_asn_batches(asns, sample, FOFA_TIMEOUT, FOFA_RETRIES,
@@ -2234,6 +2339,14 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
             fh.flush()
             del passed
 
+            # 每扫完一个 ASN 就落一次状态 —— 最多丢一个 ASN 的进度
+            done_asns.add(asn)
+            save_scan_state({"fingerprint": fp, "done": sorted(done_asns),
+                             "started": state.get("started") or
+                             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                             "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                             "found": found})
+
             if asn_done % 5 == 0 or asn_done == total_asns:
                 el = time.time() - started
                 log(f"[*] 进度 {asn_done}/{total_asns} 个 ASN，"
@@ -2241,6 +2354,7 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
 
     # 全部跑完 -> 原子替换正式结果
     os.replace(tmp_path, stage1_path)
+    clear_scan_state()
     log(f"[*] 逐 ASN 流水线完成：{total_asns} 个 ASN，"
         f"找到 {found} 个反代 -> {stage1_path}")
     return found, True

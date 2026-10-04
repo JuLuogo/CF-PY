@@ -323,7 +323,7 @@ def load_config(path):
 def apply_config(cfg):
     global token, downloadBytes, previousCountry, hops, ONLY_OUTPUT_BEST_ROUTE
     global OUTPUT_REGIONS, OUTPUT_SPLIT
-    global USE_NATIVE_SOCKET
+    global USE_NATIVE_SOCKET, EXTRA_HTTP_PORTS
     global USE_ASYNCIO, ASYNCIO_CONCURRENCY
     global STAGE0_ENABLED, STAGE0_TIMEOUT, STAGE0_CONCURRENCY
     global DEFAULT_INPUT, DEFAULT_IP_OUTPUT, DEFAULT_CSV_OUTPUT, OUTPUT_FOLDER_PATH
@@ -363,6 +363,9 @@ def apply_config(cfg):
         OUTPUT_SPLIT = bool(cfg["OUTPUT_SPLIT"])
     if "USE_NATIVE_SOCKET" in cfg:
         USE_NATIVE_SOCKET = bool(cfg["USE_NATIVE_SOCKET"])
+    if "HTTP_PORTS" in cfg:
+        EXTRA_HTTP_PORTS = {int(x) for x in re.split(r"[,;\s]+", str(cfg["HTTP_PORTS"]).strip().strip('"'))
+                            if x.strip().isdigit()}
     if "USE_ASYNCIO" in cfg:
         USE_ASYNCIO = bool(cfg["USE_ASYNCIO"])
     if "STAGE0_ENABLED" in cfg:
@@ -939,15 +942,24 @@ _SSL_CTX = None
 
 
 async def availability_async(ip, timeout, port, sem, req, host):
-    """asyncio 版可用性检查。语义和 availability() 完全一致。"""
+    """asyncio 版可用性检查。语义和 availability() 完全一致。
+
+    HTTP 端口（80/8080/2052…）走明文，不建 TLS —— 拿 TLS 去连 80 永远连不通。
+    """
     import asyncio
+    use_tls = not port_uses_http(port)
     async with sem:
         w = None
         try:
-            r, w = await asyncio.wait_for(
-                asyncio.open_connection(ip, int(port or 443),
-                                        ssl=_SSL_CTX, server_hostname=host),
-                timeout=timeout)
+            if use_tls:
+                r, w = await asyncio.wait_for(
+                    asyncio.open_connection(ip, int(port or 443),
+                                            ssl=_SSL_CTX, server_hostname=host),
+                    timeout=timeout)
+            else:
+                r, w = await asyncio.wait_for(
+                    asyncio.open_connection(ip, int(port or 80)),
+                    timeout=timeout)
             w.write(req)
             await w.drain()
             data = await asyncio.wait_for(r.read(8192), timeout=timeout)
@@ -1037,8 +1049,32 @@ def stage1_async(items, concurrency, timeout):
 #   改用原生 socket 后没有进程创建，同一个连接流程走完就关，开销只剩网络本身。
 USE_NATIVE_SOCKET = True   # False 就退回 curl（兼容排查用）
 
+# CF 的端口分两类，必须走不同协议 —— 拿 HTTPS 去连 80 永远连不通。
+#   HTTPS: 443 2053 2083 2087 2096 8443
+#   HTTP : 80  8080 8880 2052 2082 2086 2095
+# 不在表里的端口（比如 25565 这种非标口）默认按 HTTPS 试，
+# 想强制走 HTTP 就用 config.ini 的 HTTP_PORTS 覆盖。
+CF_HTTP_PORTS = {80, 8080, 8880, 2052, 2082, 2086, 2095}
+CF_HTTPS_PORTS = {443, 2053, 2083, 2087, 2096, 8443}
+EXTRA_HTTP_PORTS = set()      # 用户额外指定要按 HTTP 测的端口
 
-def _http_get_via(ip, port, host, path, timeout, max_bytes=16384):
+
+def port_uses_http(port):
+    """这个端口该用明文 HTTP 还是 HTTPS。"""
+    try:
+        p = int(str(port or "443").strip())
+    except (TypeError, ValueError):
+        return False
+    if p in EXTRA_HTTP_PORTS:
+        return True
+    if p in CF_HTTP_PORTS:
+        return True
+    if p in CF_HTTPS_PORTS:
+        return False
+    return False              # 非标端口默认按 HTTPS
+
+
+def _http_get_via(ip, port, host, path, timeout, max_bytes=16384, use_tls=True):
     """对指定 IP 发一个 HTTPS GET，SNI/Host 用 host。返回响应体 bytes 或 None。
 
     用原生 socket + ssl，不创建子进程。
@@ -1047,6 +1083,8 @@ def _http_get_via(ip, port, host, path, timeout, max_bytes=16384):
     import ssl as _ssl
 
     port = int(port or 443)
+    if not use_tls:
+        return _http_get_plain(ip, port, host, path, timeout, max_bytes)
     ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
     # 我们连的是任意第三方 IP，证书必然是别人的，所以不校验 ——
     # 我们要判断的是「这个 IP 有没有把 SNI=host 的流量反代到 CF」，
@@ -1118,6 +1156,61 @@ def _http_get_via(ip, port, host, path, timeout, max_bytes=16384):
     return body
 
 
+def _http_get_plain(ip, port, host, path, timeout, max_bytes=16384):
+    """明文 HTTP GET（端口 80/8080 这类）。不建 TLS，开销更小。"""
+    import socket as _socket
+
+    req = (f"GET {path} HTTP/1.1\r\n"
+           f"Host: {host}\r\n"
+           f"User-Agent: cfip/1.0\r\n"
+           f"Accept: */*\r\n"
+           f"Connection: close\r\n\r\n").encode()
+    sock = None
+    try:
+        sock = _socket.create_connection((ip, port), timeout=timeout)
+        sock.settimeout(timeout)
+        sock.sendall(req)
+        buf = bytearray()
+        while len(buf) < max_bytes:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\r\n\r\n" in buf and len(buf) > 256:
+                break
+        raw = bytes(buf)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    idx = raw.find(b"\r\n\r\n")
+    return raw[idx + 4:] if idx >= 0 else raw
+
+
+def availability_http(ip, timeout=CURL_TIMEOUT_SEC, port="80"):
+    """明文 HTTP 版可用性检查（端口 80/8080/2052 等）。"""
+    path = urlparse(AVAILABILITY_URL).path or "/cdn-cgi/trace"
+    body = _http_get_via(ip, port, AVAILABILITY_HOST, path, timeout, use_tls=False)
+    if not body:
+        return None
+    info = {}
+    for line in body.decode("utf-8", "replace").splitlines():
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip().lower(), v.strip()
+        if k == "loc":
+            info["cfcountry"] = v.upper()
+        elif k == "colo":
+            info["colo"] = v.upper()
+    return info if info.get("cfcountry") else None
+
+
 def availability_native(ip, timeout=CURL_TIMEOUT_SEC, port="443"):
     """可用性检查的原生实现：连 ip:port，SNI 用 AVAILABILITY_HOST，
     取 /cdn-cgi/trace，看里面有没有 loc=。"""
@@ -1144,6 +1237,8 @@ def availability(ip, timeout=CURL_TIMEOUT_SEC, port="443"):
     注意 URL 里也要带端口 —— 只改 --resolve 不改 URL 的话，
     curl 还是会去连 443，测出来的结果和端口对不上。
     """
+    if port_uses_http(port):
+        return availability_http(ip, timeout, port)
     if USE_NATIVE_SOCKET:
         return availability_native(ip, timeout, port)
     port = str(port or "443")

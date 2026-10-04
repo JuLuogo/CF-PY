@@ -750,7 +750,8 @@ function renderProgress(st){
   // 当前任务 = 第一个还没跑完的阶段
   let curTask = null;
   for (const k of STAGE_ORDER) {
-    if (prog[k] && (prog[k].pct == null || prog[k].pct < 100)) { curTask = k; break; }
+    const p = prog[k];
+    if (p && !p.skipped && (p.pct == null || p.pct < 100)) { curTask = k; break; }
   }
   if (!curTask) {
     // 都跑完了，或者都还没开始 -> 取最后一个有数据的
@@ -779,6 +780,17 @@ function renderProgress(st){
       return '<div style="margin-bottom:12px;opacity:.45">'
         + '<div class="row" style="margin:0 0 4px;justify-content:space-between">'
         +   '<span>' + esc(STAGE_SHORT[k] || k) + ' <span class="k">未开始</span></span>'
+        +   '<span class="k" style="margin:0">—</span>'
+        + '</div>'
+        + '<div class="bar"><i style="width:0"></i></div>'
+        + '</div>';
+    }
+    // 上游模式下 stage2/stage3 压根不会跑，标成「已跳过」而不是「未开始」
+    if (p.skipped) {
+      return '<div style="margin-bottom:12px;opacity:.5">'
+        + '<div class="row" style="margin:0 0 4px;justify-content:space-between">'
+        +   '<span>' + esc(p.name || STAGE_SHORT[k] || k)
+        +     ' <span class="pill idle">已跳过</span></span>'
         +   '<span class="k" style="margin:0">—</span>'
         + '</div>'
         + '<div class="bar"><i style="width:0"></i></div>'

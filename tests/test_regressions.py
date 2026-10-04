@@ -493,6 +493,54 @@ def test_pool_safety():
     check("空结果不替换池子", "不做空替换" in src)
 
 
+
+
+# ---------------------------------------------------------------- 15. 端口协议
+def test_port_protocols():
+    """CF 的端口分两类，拿 HTTPS 去连 80 永远连不通。
+    之前只走 HTTPS，所以 PORTS 里填 80 是无效的。
+    """
+    import ip
+    http_ports = ["80", "8080", "8880", "2052", "2082", "2086", "2095"]
+    https_ports = ["443", "2053", "2083", "2087", "2096", "8443"]
+    bad = [p for p in http_ports if not ip.port_uses_http(p)]
+    check("HTTP 端口识别正确", not bad, f"这些没识别成 HTTP: {bad}")
+    bad2 = [p for p in https_ports if ip.port_uses_http(p)]
+    check("HTTPS 端口识别正确", not bad2, f"这些被误判成 HTTP: {bad2}")
+    check("非标端口默认按 HTTPS", not ip.port_uses_http("25565"))
+
+    src = open(os.path.join(ROOT, "ip.py"), encoding="utf-8").read()
+    check("有明文 HTTP 实现", "def _http_get_plain" in src)
+    check("有 availability_http", "def availability_http" in src)
+    check("asyncio 版按端口选协议", "use_tls = not port_uses_http(port)" in src)
+    check("支持 HTTP_PORTS 覆盖", "EXTRA_HTTP_PORTS" in src)
+
+
+# ---------------------------------------------------------------- 16. 断点续跑
+def test_resume():
+    """vps 档位全量要 12 小时，一次意外重启就前功尽弃（用户机器崩过 7 次）。
+    """
+    src = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    check("有配置指纹", "def scan_fingerprint" in src)
+    check("有状态读写", "def save_scan_state" in src and "def load_scan_state" in src)
+    check("每扫完一个 ASN 落状态", "done_asns.add(asn)" in src)
+    check("续跑用追加模式", 'mode = "a" if resuming else "w"' in src)
+    check("配置变了就重扫", "当作新一轮重新扫" in src)
+    check("跑完清理状态", "clear_scan_state()" in src)
+
+
+# ---------------------------------------------------------------- 17. 跳过标记
+def test_skipped_stages():
+    """上游模式只跑 stage0/stage1，stage2/stage3 压根不会跑。
+    不标记的话面板上它们永远停在「未开始」，看不出是没轮到还是不会跑。
+    """
+    f = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    w = open(os.path.join(ROOT, "webui.py"), encoding="utf-8").read()
+    check("后端会标记 skipped", '"skipped": True' in f)
+    check("面板渲染「已跳过」", "已跳过" in w)
+    check("当前任务不选已跳过的阶段", "!p.skipped" in w)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  回归测试")
@@ -501,7 +549,8 @@ if __name__ == "__main__":
                test_multiport, test_notify_summary, test_files_ok, test_webui,
                test_undefined_globals, test_streaming_sampling,
                test_once_semantics, test_two_datasets, test_progress_keys,
-               test_no_bulk_candidate_file, test_pool_safety):
+               test_no_bulk_candidate_file, test_pool_safety,
+               test_port_protocols, test_resume, test_skipped_stages):
         print(f"\n[{fn.__name__}] {fn.__doc__.splitlines()[0] if fn.__doc__ else ''}")
         try:
             fn()
