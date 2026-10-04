@@ -1569,7 +1569,8 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
         log(f"list regions  = {LIST_REGIONS or '(不筛选)'}")
     elif source == "asn":
         log(f"asns          = {ASNS or '(未指定)'}")
-        log(f"asn sample    = 每个 ASN 采样 {ASN_SAMPLE} 个 /24")
+        log(f"asn sample    = 共采样 {ASN_SAMPLE} 个 /24（跨所有 ASN）" if ASN_SAMPLE
+            else "asn sample    = 全量（不采样）")
     elif source == "fofa":
         log(f"preset        = {FOFA_PRESET if not FOFA_QUERY_TEMPLATE else '自定义 -query'}")
         log(f"template      = {template}")
@@ -1661,7 +1662,7 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
             log("[!] -source asn 需要指定 -asns（名字或 AS 号）。可用名字：")
             log(f"    {', '.join(sorted(ASN_GROUPS))}")
             return 5
-        log(f"[*] 查询 {len(asns)} 个 ASN 的宣告网段，每个采样 {ASN_SAMPLE} 个 /24")
+        log(f"[*] 查询 {len(asns)} 个 ASN 的宣告网段，共采样 {ASN_SAMPLE} 个 /24")
         raw_rows, astat = asn_fetch(asns, ASN_SAMPLE, FOFA_TIMEOUT, FOFA_RETRIES, DEBUG)
         if not raw_rows:
             log("[!] 没有采到任何地址。")

@@ -24,14 +24,25 @@ ok()   { printf '%s\n' "${GRN} ✓${RST} $*"; }
 warn() { printf '%s\n' "${YEL} !${RST} $*"; }
 die()  { printf '%s\n' "${RED} ✗${RST} $*" >&2; exit 1; }
 
-# 脚本是 curl | bash 执行的，stdin 是管道，交互必须走 /dev/tty
-if [ -r /dev/tty ]; then TTY=/dev/tty; else TTY=""; fi
+# 脚本是 curl | bash 执行的，stdin 是管道，交互必须走 /dev/tty。
+#
+# 但不能只看 /dev/tty 能不能打开 —— 在 CI、重定向、被别的脚本调用等
+# 没有终端的环境里，/dev/tty 依然可以打开，`read` 就会永久阻塞。
+# 判据：/dev/tty 是字符设备 **且 stdout 是终端**。
+#   curl | bash（人在终端前）：stdout 是 tty  -> 交互
+#   被脚本调用 / CI / 重定向日志：stdout 是管道 -> 全用默认值，不阻塞
+if [ -c /dev/tty ] && [ -t 1 ] && [ "${CFIP_NONINTERACTIVE:-0}" != "1" ]; then
+  TTY=/dev/tty
+else
+  TTY=""
+fi
 
 ask() {  # ask <提示> <默认值>
   local prompt="$1" def="$2" ans=""
   if [ -n "$TTY" ]; then
-    printf '%s' "$prompt" > "$TTY"
-    IFS= read -r ans < "$TTY" || ans=""
+    printf '%s' "$prompt" > "$TTY" 2>/dev/null || true
+    # 再兜一层超时：万一终端断了，也不至于卡死
+    IFS= read -r -t "${CFIP_ASK_TIMEOUT:-120}" ans < "$TTY" || ans=""
   fi
   printf '%s' "${ans:-$def}"
 }
@@ -39,8 +50,8 @@ ask() {  # ask <提示> <默认值>
 ask_secret() {
   local prompt="$1" def="$2" ans=""
   if [ -n "$TTY" ]; then
-    printf '%s' "$prompt" > "$TTY"
-    IFS= read -r ans < "$TTY" || ans=""
+    printf '%s' "$prompt" > "$TTY" 2>/dev/null || true
+    IFS= read -r -t "${CFIP_ASK_TIMEOUT:-120}" ans < "$TTY" || ans=""
   fi
   printf '%s' "${ans:-$def}"
 }
