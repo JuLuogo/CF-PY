@@ -1386,14 +1386,47 @@ def _dir_size(path):
 
 
 def cleanup_outputs(aggressive=False):
-    """清理日志和旧结果，返回一份清理报告。"""
+    """清理日志和旧结果，返回一份清理报告。
+
+    顺序很重要：**先删旧日期目录，再轮转文件**。
+    反过来的话，删目录里的文件会更新目录 mtime，等到判断"目录是否过期"时
+    它就变成"刚刚修改过"了，永远删不掉（这个坑实测踩过）。
+    而且判断过期优先用目录名里的日期（output/{YYYY-MM-DD}），比 mtime 可靠得多。
+    """
     outdir = os.path.join(HERE, "output")
     if not os.path.isdir(outdir):
         return {"freed_mb": 0.0, "logs": 0, "results": 0, "free_mb": _free_mb(HERE)}
 
+    freed = 0
+    keep_days = 1 if aggressive else KEEP_DAYS
+
+    # ---- 第一步：删过期的日期目录（趁里面的文件还没被删、mtime 还没被动过）----
+    cutoff = time.time() - keep_days * 86400
+    try:
+        entries = os.listdir(outdir)
+    except OSError:
+        entries = []
+    for name in entries:
+        p = os.path.join(outdir, name)
+        if not os.path.isdir(p):
+            continue
+        old = False
+        try:                                     # 优先按目录名解析日期
+            d = datetime.strptime(name, "%Y-%m-%d")
+            old = d.timestamp() < cutoff
+        except ValueError:
+            try:                                 # 名字不是日期就退回 mtime
+                old = os.path.getmtime(p) < cutoff
+            except OSError:
+                continue
+        if old:
+            freed += _dir_size(p)
+            shutil.rmtree(p, ignore_errors=True)
+
+    # ---- 第二步：轮转日志和结果文件 ----
     keep_logs = 1 if aggressive else KEEP_LOGS
     keep_res = 3 if aggressive else KEEP_RESULTS
-    logs, results, freed = [], [], 0
+    logs, results = [], []
 
     for dirpath, _d, files in os.walk(outdir):
         for fn in files:
@@ -1421,21 +1454,6 @@ def cleanup_outputs(aggressive=False):
                 freed += sz
             except OSError:
                 pass
-
-    cutoff = time.time() - KEEP_DAYS * 86400
-    try:
-        for d in os.listdir(outdir):
-            p = os.path.join(outdir, d)
-            if not os.path.isdir(p):
-                continue
-            try:
-                if os.path.getmtime(p) < cutoff:
-                    freed += _dir_size(p)
-                    shutil.rmtree(p, ignore_errors=True)
-            except OSError:
-                pass
-    except OSError:
-        pass
 
     return {"freed_mb": round(freed / 1024 / 1024, 2),
             "logs": len(logs), "results": len(results),
@@ -1873,9 +1891,12 @@ def main():
     if a.asns is not None:
         ASNS = a.asns.strip()
     if a.asn_sample is not None:
-        ASN_SAMPLE = max(1, a.asn_sample)
+        # 注意不能用 max(1, ...)：0 是有意义的值，表示「全量不采样」。
+        # 写成 max(1, 0) 会把全量模式悄悄变成「只取 1 个」。
+        ASN_SAMPLE = max(0, a.asn_sample)
         if ASN_SAMPLE > 2000:
-            log(f"[!] -asn-sample {ASN_SAMPLE} 偏大。扫描第三方网段请克制，建议 50~200。")
+            log(f"[!] -asn-sample {ASN_SAMPLE} 偏大。扫描第三方网段请克制，建议 50~200；")
+            log("    真要全量扫就填 0（表示不采样、扫全部 /24）。")
     if a.asn_regions is not None:
         ASN_REGIONS = a.asn_regions.strip()
     if a.asn_exclude_regions is not None:
