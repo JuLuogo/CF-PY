@@ -262,7 +262,7 @@ def apply_config(cfg):
     global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
     global THREADS, LOOP
     global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE, FULL_SCAN
-    global POOL_ENABLED, POOL_FILE, POOL_MAX_AGE_DAYS
+    global POOL_ENABLED, POOL_FILE, POOL_MAX_AGE_DAYS, POOL_MIN_KEEP_RATIO
     global UPSTREAM_STAGE1_ONLY, POOL_MODE
 
     get = cfg.get
@@ -313,6 +313,8 @@ def apply_config(cfg):
     if "POOL_ENABLED" in cfg:         POOL_ENABLED = as_bool(get("POOL_ENABLED"), POOL_ENABLED)
     if "POOL_FILE" in cfg:            POOL_FILE = str(get("POOL_FILE") or POOL_FILE).strip().strip('"')
     if "POOL_MAX_AGE_DAYS" in cfg:    POOL_MAX_AGE_DAYS = as_int(get("POOL_MAX_AGE_DAYS"), POOL_MAX_AGE_DAYS)
+    if "POOL_MIN_KEEP_RATIO" in cfg:
+        POOL_MIN_KEEP_RATIO = float(get("POOL_MIN_KEEP_RATIO"))
     if "UPSTREAM_STAGE1_ONLY" in cfg:
         UPSTREAM_STAGE1_ONLY = as_bool(get("UPSTREAM_STAGE1_ONLY"), UPSTREAM_STAGE1_ONLY)
     if "POOL_MODE" in cfg:
@@ -1739,6 +1741,13 @@ POOL_ENABLED = True
 POOL_FILE = "./output/pool.csv"
 POOL_MAX_AGE_DAYS = 30      # 超过这么多天没再出现的条目才淘汰
 
+# 替换模式下的安全阀：新结果不到旧池子的这个比例时，改成并集而不是替换。
+# 理由：全量扫描正常情况下每轮结果量级稳定，如果某轮突然只剩几个，
+# 更可能是【瞬时故障】（网络抖动、上游限流、部分 ASN 查询失败），
+# 而不是「反代真的都死了」。这时替换会把几千个可用 IP 一次清空。
+# 0 = 关闭这个保护（严格按用户要求「扫完即替换」）。
+POOL_MIN_KEEP_RATIO = 0.1
+
 # 上游只保留 stage1 的结果。
 #   stage1 通过 = 它【确实是】反代（客观事实，跟测量点无关）
 #   stage2 通过 = 它【在这台 VPS 上】快、不丢包（主观，跟测量点强相关）
@@ -1809,6 +1818,17 @@ def update_pool(rows, complete=True):
     mode = POOL_MODE
     if mode == "auto":
         mode = "replace" if complete else "merge"
+
+    # 安全阀：新结果比旧池子小太多时，怀疑是瞬时故障，改成并集
+    old_n = len(load_pool()) if mode == "replace" else 0
+    n_new = len([r for r in (rows or []) if (r.get("ip") or "").strip()])
+    if (mode == "replace" and POOL_MIN_KEEP_RATIO > 0 and old_n >= 20
+            and n_new < old_n * POOL_MIN_KEEP_RATIO):
+        log(f"[!] 本轮只找到 {n_new} 个，而池子里原有 {old_n} 个"
+            f"（不足 {POOL_MIN_KEEP_RATIO*100:.0f}%）。")
+        log("    更可能是瞬时故障而不是反代真的都死了，本轮改成【并集】以免清空池子。")
+        log("    确认要严格替换的话，把 config.ini 的 POOL_MIN_KEEP_RATIO 设成 0。")
+        mode = "merge"
 
     old_pool = load_pool()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2120,6 +2140,103 @@ def read_final_summary(limit=200):
     return out
 
 
+# ==================== 逐 ASN 端到端流水线 ====================
+# 原来的做法：先把【所有】候选写进 ip.csv，再交给 ip.py 去测。
+# vps 档位全量 = 181,871 个 /24 x 254 = 4620 万个候选，
+# 按实测每行 218 字节算，ip.csv 要 10GB —— 而用户的盘只有 3GB（可用 1.6GB）。
+# 实测跑 21 分钟写了 151MB 就把盘写满，服务崩溃重启，反复 7 次。
+#
+# 改成逐 ASN 处理：这个 ASN 的候选生成出来 -> stage0 -> stage1 ->
+# 只把【通过的结果】追加到 stage1.csv -> 候选全部释放。
+# 峰值磁盘占用 = 结果文件（约 3 万个反代 x 40 字节 = 1.2MB），
+# 峰值内存 = 单个 ASN 的候选数（最大约 12 万个，约 30MB）。
+
+
+def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
+    """逐 ASN 完成「生成 -> 预筛 -> 可用性检查」，结果追加到 STAGE1_CSV。
+
+    返回 (本轮找到的反代数, 是否完整跑完)。
+    """
+    import ip as ipt
+
+    stage1_path = STAGE1_CSV if os.path.isabs(STAGE1_CSV) else os.path.join(HERE, STAGE1_CSV)
+    os.makedirs(os.path.dirname(stage1_path), exist_ok=True)
+
+    want_asn = {r.upper() for r in as_list(ASN_REGIONS)}
+    drop_asn = {r.upper() for r in as_list(ASN_EXCLUDE_REGIONS)}
+    asn_ports = as_list(PORTS) or ["443"]
+    exclude_nets = _parse_cidrs(FOFA_EXCLUDE_CIDRS)
+    skip_ips = _load_skip_ips(FOFA_SKIP_FILE)
+
+    # 本轮结果先写到 .new，全部跑完才原子替换 ——
+    # 中途崩了不会把上一轮的结果覆盖掉（池子那边也会判 complete）。
+    tmp_path = stage1_path + ".new"
+    found = 0
+    seen_keys = set()
+    asn_done = 0
+    total_asns = len(asns)
+    started = time.time()
+
+    log(f"\n[*] 逐 ASN 流水线：{total_asns} 个 ASN，"
+        f"{'全量（每个 /24 的 254 个地址）' if FULL_SCAN else f'采样 {sample} 个 /24'}")
+    log(f"    结果写入 {tmp_path}（跑完才替换正式文件）")
+
+    with open(tmp_path, "w", encoding="utf-8-sig", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(["ip", "port", "protocol", "cfcountry", "colo"])
+
+        for asn, cands in iter_asn_batches(asns, sample, FOFA_TIMEOUT, FOFA_RETRIES, DEBUG):
+            asn_done += 1
+            set_progress("asn", "抓取 · 查询 ASN 宣告网段", asn_done, total_asns, current=asn)
+            if not cands:
+                continue
+
+            # 归一化 / 排除私网 / 端口过滤（分批，避免一次性建大列表）
+            kept = []
+            for i in range(0, len(cands), 20000):
+                rows, _st = normalize(cands[i:i + 20000], set(asn_ports), exclude_nets,
+                                      skip_ips, [], 0)
+                kept.extend(rows)
+            del cands
+            if not kept:
+                continue
+
+            # stage0：TCP 预筛（把黑洞筛掉）
+            alive = kept
+            if ipt.STAGE0_ENABLED:
+                alive = ipt.stage0_tcp_filter(kept, ipt.STAGE0_TIMEOUT, ipt.STAGE0_CONCURRENCY)
+                del kept
+                if not alive:
+                    continue
+
+            # stage1：可用性（确认是不是真反代）
+            passed = ipt.stage1_async(alive, ipt.ASYNCIO_CONCURRENCY, ipt.CURL_TIMEOUT_SEC)
+            del alive
+
+            # 只把通过的写盘
+            for r in passed:
+                key = "%s:%s" % (r["ip"], r.get("port", "443"))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                wr.writerow([r["ip"], r.get("port", "443"), "https",
+                             r.get("cfcountry", ""), r.get("colo", "")])
+                found += 1
+            fh.flush()
+            del passed
+
+            if asn_done % 5 == 0 or asn_done == total_asns:
+                el = time.time() - started
+                log(f"[*] 进度 {asn_done}/{total_asns} 个 ASN，"
+                    f"已找到 {found} 个反代，耗时 {el/60:.1f} 分钟")
+
+    # 全部跑完 -> 原子替换正式结果
+    os.replace(tmp_path, stage1_path)
+    log(f"[*] 逐 ASN 流水线完成：{total_asns} 个 ASN，"
+        f"找到 {found} 个反代 -> {stage1_path}")
+    return found, True
+
+
 # ==================== 流式抓取（省内存）====================
 # 原来的做法：把 69 个 ASN 的所有 /24 全部展开成一个列表（18 万个
 # IPv4Network 对象，约 35MB），再采样、再建 18 万个 dict（约 42MB），
@@ -2192,6 +2309,87 @@ def sample_24s(nets, k, weights=None, total=None):
         seen.add(base)
         out.append(base)
     return out
+
+
+def iter_asn_batches(asns, sample, timeout, retries, debug=False):
+    """逐个 ASN 产出 (asn, [候选 dict])，边产边释放。
+
+    和 iter_asn_candidates 的区别：那个是一条条 yield 候选，
+    这个是一整个 ASN 一批 yield —— 这样调用方可以「处理完这个 ASN
+    就丢掉它的候选」，不需要把 4620 万个候选落盘或留在内存。
+
+    sample=0 表示全量（该 ASN 的所有 /24 都产出）。
+    """
+    import ipaddress
+    import tempfile
+
+    # ---- 第一遍：查网段 -> 只留数量 + 写临时文件（约 1~2MB）----
+    counts = {}
+    cache = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".nets",
+                                        delete=False, prefix="cfip-nets-")
+    cache_path = cache.name
+    try:
+        for idx, asn in enumerate(asns, 1):
+            set_progress("asn", "抓取 · 查询 ASN 宣告网段", idx, len(asns), current=asn)
+            try:
+                nets = asn_prefixes(asn, timeout, retries, debug)
+            except Exception as e:               # noqa: BLE001
+                log(f"    [ASN {asn}] 查询失败：{e}")
+                counts[asn] = 0
+                continue
+            n24 = count_24s(nets)
+            counts[asn] = n24
+            cache.write(asn + "\t" + ",".join(str(n) for n in nets) + "\n")
+            log(f"    [ASN {asn}] 网段 {len(nets)} 个 -> /24 {n24:,} 个")
+            del nets
+        cache.close()
+
+        grand = sum(counts.values())
+        if grand <= 0:
+            return
+        log(f"[*] 共 {grand:,} 个 /24"
+            + ("（全量模式，不采样）" if not sample else f"（目标采样 {sample} 个）"))
+
+        # ---- 第二遍：逐个 ASN 读回来，采样/展开后整批 yield ----
+        with open(cache_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                asn, _, netstr = line.rstrip("\n").partition("\t")
+                n24 = counts.get(asn, 0)
+                if n24 <= 0 or not netstr:
+                    yield asn, []
+                    continue
+                nets = [ipaddress.ip_network(x) for x in netstr.split(",") if x]
+                if sample and sample > 0:
+                    k = min(max(1, round(sample * n24 / grand)), n24)
+                    addrs = sample_24s(nets, k)
+                else:
+                    addrs = []
+                    for n in nets:
+                        if n.prefixlen <= 24:
+                            step = 1 << (24 - n.prefixlen)
+                            base = int(n.network_address)
+                            addrs.extend(base + i * 256 for i in range(step))
+                        else:
+                            addrs.append(int(n.network_address))
+                del nets
+
+                out = []
+                for base in addrs:
+                    if FULL_SCAN:
+                        for host in range(1, 255):
+                            out.append({"ip": str(ipaddress.IPv4Address(base + host)),
+                                        "port": "443", "protocol": "https", "country": ""})
+                    else:
+                        out.append({"ip": str(ipaddress.IPv4Address(base + random.randint(1, 254))),
+                                    "port": "443", "protocol": "https", "country": ""})
+                del addrs
+                yield asn, out
+                del out
+    finally:
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
 
 
 def iter_asn_candidates(asns, sample, timeout, retries, debug=False, stats=None):
@@ -2409,77 +2607,24 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
         log(f"[*] 查询 {len(asns)} 个 ASN 的宣告网段，"
             f"{'全量（不采样）' if not ASN_SAMPLE else f'共采样 {ASN_SAMPLE} 个 /24'}")
 
-        # ---- 流式：边采样 -> 边过滤 -> 增量写 CSV ----
-        # 不这么做的话，18 万个候选会先在内存里堆成一个大列表，
-        # 再被 normalize 复制一份，峰值 110MB+（实测 fetch_ips.py 常驻 176MB）。
-        # 分批处理后峰值只跟批大小有关。
-        want_asn = {r.upper() for r in as_list(ASN_REGIONS)}
-        drop_asn = {r.upper() for r in as_list(ASN_EXCLUDE_REGIONS)}
-        asn_ports = as_list(PORTS) or ["443"]
-        exclude_nets = _parse_cidrs(FOFA_EXCLUDE_CIDRS)
-        skip_ips = _load_skip_ips(FOFA_SKIP_FILE)
-        total_stats = {"total": 0, "bad_ip": 0, "not_public": 0, "port": 0,
-                       "excluded": 0, "asn": 0, "skipped": 0, "dup": 0, "truncated": 0}
-        CHUNK = 20000
-        written = 0
-        fh, wr = open_csv_writer(csv_path)
-        buf = []
-        seen_all = set()
-        try:
-            for cand in iter_asn_candidates(asns, ASN_SAMPLE, FOFA_TIMEOUT,
-                                            FOFA_RETRIES, DEBUG):
-                buf.append(cand)
-                if len(buf) < CHUNK:
-                    continue
-                rows, st = normalize(buf, set(asn_ports), exclude_nets,
-                                     skip_ips, exclude_asns, 0)
-                merge_stats(total_stats, st)
-                for r in rows:
-                    wr.writerow({k: r.get(k, "") for k in CSV_HEADER})
-                    written += 1
-                del rows
-                buf = []
-            if buf:
-                rows, st = normalize(buf, set(asn_ports), exclude_nets,
-                                     skip_ips, exclude_asns, 0)
-                merge_stats(total_stats, st)
-                for r in rows:
-                    wr.writerow({k: r.get(k, "") for k in CSV_HEADER})
-                    written += 1
-                del rows
-                buf = []
-        finally:
-            fh.close()
-
-        log(f"[*] 候选过滤：原始 {total_stats['total']:,} 条 -> 保留 {written:,} 条")
-        if not written:
-            log("[!] 没有采到任何可用地址。")
-            return 4
-        # 流式路径已经写好 CSV 了，后面通用的「归一化 / 写出」不用再走
-        log(f"[*] 已写出 {written:,} 个候选 -> {csv_path}")
-        rows_for_count = [{"x": 1}] * written          # 只用来计数，不占内存
-        stats = total_stats
-        write_status(candidates=written, kept=written, source="asn",
+        # ---- 逐 ASN 端到端处理，不落地大文件 ----
+        # 原来先把所有候选写 ip.csv（vps 全量要 10GB），磁盘只有 3GB，实测崩了 7 次。
+        found, complete = run_asn_pipeline(asns, ASN_SAMPLE, extra_run_args, round_no)
+        write_status(candidates=found, kept=found, source="asn",
                      asns=ASNS, asn_sample=ASN_SAMPLE, phase="fetched")
 
-        # ---- 实测 ----
-        if a.run or FOFA_RUN:
-            rc, avail, qual = run_tester(csv_path, extra_run_args)
-            final = read_final_summary()
-            # 这一轮是否【扫全了】。只有扫全了才能做差集（替换）：
-            # 全量扫描下「没出现在结果里」= 测了且失败 = 确定死亡；
-            # 中途中断时「没出现」可能只是没扫到，做差集会误杀。
-            complete = (rc == 0)
-            if POOL_ENABLED:
-                if UPSTREAM_STAGE1_ONLY:
-                    pool_rows = read_stage1_results()
-                else:
-                    pool_rows = final.get("rows") or []
+        # ---- 池子 ----
+        if POOL_ENABLED:
+            pool_rows = read_stage1_results() if UPSTREAM_STAGE1_ONLY else []
+            if pool_rows:
                 update_pool(pool_rows, complete=complete)
-            write_status(phase="done", test_rc=rc, final=final,
-                         pool=pool_summary() if POOL_ENABLED else None)
-            send_notification(round_no, avail, qual, loop_secs)
-            return rc
+            else:
+                log("[!] 本轮没找到反代，池子保持不变（不做空替换）")
+
+        final = read_final_summary()
+        write_status(phase="done", final=final,
+                     pool=pool_summary() if POOL_ENABLED else None)
+        send_notification(round_no, (found, found), found, loop_secs)
         return 0
 
     else:                                    # fofa

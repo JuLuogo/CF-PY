@@ -853,25 +853,22 @@ async function refresh(){
       '<div class="card" style="margin:0"><div class="k">' + k + '</div>'
       + '<div class="v sm">' + esc(v) + '</div></div>').join('');
 
-    // 两套结果
-    const all = await api('/api/results');
-    renderTable('resAll', 'resCountAll', all.rows || [], '还没有结果');
-
+    // 两套结果都从【池子】读 ——
+    // 上游模式只做 stage1，不产出 ip.py 的 CSV，所以不能读 /api/results。
     try{
-      const reg = await api('/api/results/region');
-      if (reg.exists) {
-        renderTable('resRegion', 'resCountRegion', reg.rows || [], '地区列表里暂时没有 IP');
-      } else {
-        document.getElementById('resCountRegion').textContent = '';
-        renderTable('resRegion', 'resCountRegion', [],
-          '还没有地区列表（OUTPUT_REGIONS=' + esc((reg.regions || []).join(',')) + '）');
-      }
+      const all = await api('/api/pool');
+      const rows = all.rows || [];
+      renderTable('resAll', 'resCountAll', rows, '池子还是空的（等一轮扫完）');
+      const regRows = rows.filter(r => REGIONS.includes(String(r.country || '').toUpperCase()));
+      renderTable('resRegion', 'resCountRegion', regRows,
+        '池子里暂时没有 ' + REGIONS.join('/') + ' 的 IP');
+      document.getElementById('iptxt').textContent = rows.length
+        ? rows.map(r => r.ip + (r.port && r.port !== '443' ? ':' + r.port : '')).join('\n')
+        : '—';
     }catch(e){
-      renderTable('resRegion', 'resCountRegion', [], '读取失败：' + esc(e.message));
+      renderTable('resAll', 'resCountAll', [], '读取池子失败：' + esc(e.message));
+      renderTable('resRegion', 'resCountRegion', [], '读取池子失败');
     }
-
-    document.getElementById('iptxt').textContent =
-      (all.ip_txt && all.ip_txt.length) ? all.ip_txt.join('\n') : '—';
 
     const lg = await api('/api/log?lines=200');
     const pre = document.getElementById('log');
@@ -885,6 +882,8 @@ async function refresh(){
 }
 
 let CFG = {values:{}, schema:[], secret_keys:[]};
+// 地区白名单，用来在「地区版」表里做前端过滤（从 /api/config 里取）
+let REGIONS = ['HK','JP','SG','KR','TW'];
 
 function fieldHtml(it, v){
   const id = 'cfg_' + it.key;
@@ -921,6 +920,9 @@ async function loadSettings(){
     const r = await api('/api/config');
     if (!r.ok) { document.getElementById('cfgform').innerHTML = '<span class="err">'+esc(r.error)+'</span>'; return; }
     CFG = r; renderSettings();
+    const raw = (r.values && r.values.OUTPUT_REGIONS) || '';
+    const parsed = String(raw).split(/[,;\s]+/).map(x => x.trim().toUpperCase()).filter(Boolean);
+    if (parsed.length) REGIONS = parsed;
   }catch(e){ document.getElementById('cfgform').innerHTML = '<span class="err">读取失败：'+esc(e.message)+'</span>'; }
 }
 

@@ -439,6 +439,53 @@ def test_progress_keys():
     check("当前任务有高亮", "当前任务" in w)
 
 
+
+
+# ---------------------------------------------------------------- 13. 不能落地大文件
+def test_no_bulk_candidate_file():
+    """vps 档位全量 = 181,871 个 /24 x 254 = 4620 万个候选。
+    如果先把它们全写进一个 CSV 再测，按实测每行 218 字节要 10GB，
+    而用户的盘只有 3GB（可用 1.6GB）—— 实测跑 21 分钟写满、服务崩了 7 次。
+
+    所以 ASN 分支必须是「逐 ASN 端到端处理」，不能有
+    「先写完整候选文件、再交给 ip.py」那一步。
+    """
+    src = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+
+    check("有逐 ASN 流水线 run_asn_pipeline", "def run_asn_pipeline(" in src)
+    check("有 iter_asn_batches", "def iter_asn_batches(" in src)
+    check("结果先写 .new 再原子替换", 'tmp_path = stage1_path + ".new"' in src)
+
+    # ASN 分支里不该再出现「把候选写进 csv_path」
+    a = src.index("def run_once(")
+    b = src.index("def main()")
+    body = src[a:b]
+    # 找到 asn 分支那一段（到 fofa 分支为止）
+    try:
+        ai = body.index('log(f"[*] 查询 {len(asns)} 个 ASN 的宣告网段，"')
+        bi = body.index("else:                                    # fofa")
+        asn_branch = body[ai:bi]
+    except ValueError:
+        asn_branch = body
+    check("ASN 分支不再写整份候选 CSV", "open_csv_writer" not in asn_branch
+          and "run_tester(csv_path" not in asn_branch,
+          "ASN 分支还在写候选文件 —— 全量会撑爆磁盘")
+
+    # 结果文件必须是小文件：池子/stage1 而不是候选
+    check("stage1 结果文件路径存在", "STAGE1_CSV" in src)
+
+
+# ---------------------------------------------------------------- 14. 池子安全阀
+def test_pool_safety():
+    """全量替换模式下，瞬时故障（网络抖动/限流/部分 ASN 查询失败）
+    会让某轮结果骤减。如果不加判断直接替换，几千个可用 IP 会被一次清空。
+    """
+    src = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    check("有 POOL_MIN_KEEP_RATIO 安全阀", "POOL_MIN_KEEP_RATIO" in src)
+    check("骤减时会改成并集", "本轮改成【并集】" in src)
+    check("空结果不替换池子", "不做空替换" in src)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  回归测试")
@@ -446,7 +493,8 @@ if __name__ == "__main__":
     for fn in (test_globals_declared, test_full_scan, test_cleanup,
                test_multiport, test_notify_summary, test_files_ok, test_webui,
                test_undefined_globals, test_streaming_sampling,
-               test_once_semantics, test_two_datasets, test_progress_keys):
+               test_once_semantics, test_two_datasets, test_progress_keys,
+               test_no_bulk_candidate_file, test_pool_safety):
         print(f"\n[{fn.__name__}] {fn.__doc__.splitlines()[0] if fn.__doc__ else ''}")
         try:
             fn()
