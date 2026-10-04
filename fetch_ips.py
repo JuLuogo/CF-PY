@@ -945,7 +945,7 @@ def asn_fetch(asns, sample, timeout, retries, debug=False):
     stats = {"asns": 0, "failed": 0, "subnets": 0}
     nets24 = []
     for idx, asn in enumerate(asns, 1):
-        set_progress("asn", idx, len(asns), f"抓取阶段 · 查询 ASN 网段（{asn}）")
+        set_progress("asn", "抓取 · 查询 ASN 宣告网段", idx, len(asns), current=asn)
         try:
             nets = asn_prefixes(asn, timeout, retries, debug)
         except FetchError as e:
@@ -1022,8 +1022,9 @@ def geo_tag(rows, timeout=30, debug=False):
                 tagged += 1
         if i + GEO_BATCH < len(ips):
             time.sleep(4.5)                          # 15 请求/分钟 → 每 4.5s 一批
-        set_progress("geo", min(i + GEO_BATCH, len(ips)), len(ips),
-                     "抓取阶段 · 地区标注（ip-api）")
+        set_progress("geo", "抓取 · 地区标注（ip-api）",
+                     min(i + GEO_BATCH, len(ips)), len(ips),
+                     current=f"{min(i + GEO_BATCH, len(ips))}/{len(ips)} 个地址")
     if debug:
         log(f"[DEBUG] 地区标注成功 {tagged}/{len(ips)}")
     return tagged
@@ -1427,18 +1428,23 @@ def run_tester(csv_path, extra_args):
 
         # ---- 实时上报进度给 Web 面板 ----
         # 形如：12:34:56 [availability 150/300] 1.2.3.4 | PASS ...
-        m = re.search(r"\[(\w+) (\d+)/(\d+)\]", line)
+        m = re.search(r"\[(\w+) (\d+)/(\d+)\]\s+(\S+)", line)
         if m:
             stage, done, total = m.group(1), int(m.group(2)), int(m.group(3))
+            cur = m.group(4)
             now = time.time()
             # 节流：每 3 秒或最后一条才写一次，别把磁盘刷爆
             if done == total or now - _prog_last.get("t", 0) > 3:
                 _prog_last["t"] = now
-                names = {"availability": "第一阶段 · 可用性检查",
-                         "speed/latency": "第二阶段 · 延迟与测速",
-                         "traceroute": "第三阶段 · 线路分析"}
-                set_progress(stage, done, total, names.get(stage, stage),
-                             {"last_line": line[:160]})
+                keys = {"availability": ("s1", "第一阶段 · 可用性检查"),
+                        "speed/latency": ("s2", "第二阶段 · 延迟与测速"),
+                        "traceroute": ("s3", "第三阶段 · 线路分析")}
+                k, nm = keys.get(stage, (stage, stage))
+                # 当前 IP 可能是 "1.2.3.4" 或 "1.2.3.4:8443"
+                cur_ip = cur.split(":")[0]
+                set_progress(k, nm, done, total, ip=cur_ip,
+                             extra={"last_line": line[:160],
+                                    "port": cur.split(":")[1] if ":" in cur else "443"})
         elif line.startswith("[*]") or "阶段" in line:
             write_status(last_line=line[:160])
     p.wait()
@@ -1606,21 +1612,62 @@ def disk_guard():
     return free
 
 
-def set_progress(stage, done=None, total=None, name="", extra=None):
-    """上报当前进度给 Web 面板（写进 status.json）。
+def read_status():
+    """读当前 status.json。"""
+    path = os.path.join(HERE, "output", "status.json")
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f) or {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
 
-    写文件比内存共享慢，所以调用方要自己节流；这里只负责拼字段。
+
+def cidr24(ip):
+    """/24 网段，界面上用来显示「当前扫到哪个段」。"""
+    p = str(ip or "").split(".")
+    return ".".join(p[:3]) + ".0/24" if len(p) == 4 else ""
+
+
+def set_progress(key, name, done=None, total=None, current="", ip="", cidr="", extra=None):
+    """上报某一层的进度给 Web 面板。
+
+    status.json 里维护一个 progress 字典，每层一个 key：
+      asn   抓取 · 查询 ASN 网段     current = 当前 ASN
+      geo   抓取 · 地区标注
+      s1    第一阶段 · 可用性        ip = 当前 IP，cidr = 当前 /24
+      s2    第二阶段 · 延迟与测速
+      s3    第三阶段 · 线路分析
+    面板上就能并排显示多条进度条。
     """
-    d = {"phase": "running", "stage": stage, "stage_name": name or stage}
+    st = read_status()
+    prog = st.get("progress") or {}
+    d = {"name": name}
     if done is not None:
-        d["stage_done"] = done
+        d["done"] = done
     if total is not None:
-        d["stage_total"] = total
+        d["total"] = total
     if done is not None and total:
-        d["progress_pct"] = round(done * 100.0 / total, 1)
+        d["pct"] = round(done * 100.0 / total, 1)
+    if current:
+        d["current"] = current
+    if ip:
+        d["ip"] = ip
+        d["cidr"] = cidr or cidr24(ip)
+    elif cidr:
+        d["cidr"] = cidr
     if extra:
         d.update(extra)
-    write_status(**d)
+    prog[key] = d
+    write_status(progress=prog, phase="running")
+
+
+def clear_progress(*keys):
+    """清掉指定层的进度（阶段切换、开新一轮时用）。"""
+    st = read_status()
+    prog = st.get("progress") or {}
+    for k in keys:
+        prog.pop(k, None)
+    write_status(progress=prog)
 
 
 # ==================== 每日请求额度守卫 ====================

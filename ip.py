@@ -74,6 +74,14 @@ SORT_MODE = "score"
 
 ONLY_OUTPUT_BEST_ROUTE = False
 
+# ==================== 两套输出 ====================
+# 需求：维护两套列表 ——
+#   第一套：所有可用 IP，完全不限制地区
+#   第二套：只保留指定地区的 IP
+# 两者都写成文件，Web 面板和 API 各自提供。
+OUTPUT_REGIONS = "HK,JP,SG,KR,TW"   # 第二套的地区白名单
+OUTPUT_SPLIT = True                 # 是否额外产出第二套（关掉就只出全量）
+
 # 线路缓存：traceroute 结果按 /24 网段缓存到本地文件，避免重复 tracert
 ROUTE_CACHE_FILE = "./route_cache.json"
 ROUTE_CACHE_PREFIXLEN = 24
@@ -314,6 +322,9 @@ def load_config(path):
 
 def apply_config(cfg):
     global token, downloadBytes, previousCountry, hops, ONLY_OUTPUT_BEST_ROUTE
+    global OUTPUT_REGIONS, OUTPUT_SPLIT
+    global USE_NATIVE_SOCKET
+    global USE_ASYNCIO, ASYNCIO_CONCURRENCY
     global DEFAULT_INPUT, DEFAULT_IP_OUTPUT, DEFAULT_CSV_OUTPUT, OUTPUT_FOLDER_PATH
     global DEFAULT_THREADS, MAX_IO_THREADS, DEFAULT_SPEED_WORKERS
     global SPEED_TEST_URL, AVAILABILITY_URL, AVAILABILITY_HOST
@@ -345,6 +356,16 @@ def apply_config(cfg):
             pass
     if "ONLY_OUTPUT_BEST_ROUTE" in cfg:
         ONLY_OUTPUT_BEST_ROUTE = bool(cfg["ONLY_OUTPUT_BEST_ROUTE"])
+    if "OUTPUT_REGIONS" in cfg:
+        OUTPUT_REGIONS = str(cfg["OUTPUT_REGIONS"] or "").strip().strip('"')
+    if "OUTPUT_SPLIT" in cfg:
+        OUTPUT_SPLIT = bool(cfg["OUTPUT_SPLIT"])
+    if "USE_NATIVE_SOCKET" in cfg:
+        USE_NATIVE_SOCKET = bool(cfg["USE_NATIVE_SOCKET"])
+    if "USE_ASYNCIO" in cfg:
+        USE_ASYNCIO = bool(cfg["USE_ASYNCIO"])
+    if "ASYNCIO_CONCURRENCY" in cfg:
+        ASYNCIO_CONCURRENCY = max(1, int(cfg["ASYNCIO_CONCURRENCY"]))
     if "DEFAULT_INPUT" in cfg:
         DEFAULT_INPUT = str(cfg["DEFAULT_INPUT"])
     if "DEFAULT_IP_OUTPUT" in cfg:
@@ -766,13 +787,242 @@ def submit_batched(ex, fn, items, batch=TASK_BATCH):
         del fmap
 
 
+# ==================== asyncio 版可用性检查 ====================
+# 为什么单核 VPS 上 asyncio 明显更快：
+#   线程池版每个在飞的请求占一个 OS 线程。1 核上开 500 个线程，
+#   内核光做上下文切换就忙不过来，Python 的 GIL 还会让它们互相等。
+#   asyncio 是单线程事件循环，500 个并发连接也只是 500 个 socket，
+#   没有线程栈、没有上下文切换 —— 单核上这是数量级的差别。
+#   （多核机器上两者差不多，实测都是 ~230 个/秒，瓶颈在网络 RTT。）
+USE_ASYNCIO = True          # False 就退回线程池
+ASYNCIO_CONCURRENCY = 300   # 单核建议 200~500；线程池模式别开这么高
+
+
+def _ssl_ctx():
+    import ssl as _ssl
+    c = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+    # 连的是任意第三方 IP，证书必然是别人的，所以不校验 ——
+    # 判断的是「这个 IP 有没有把 SNI=host 的流量反代到 CF」，不是证书对不对。
+    c.check_hostname = False
+    c.verify_mode = _ssl.CERT_NONE
+    try:
+        c.set_ciphers("DEFAULT@SECLEVEL=1")
+    except _ssl.SSLError:
+        pass
+    return c
+
+
+_SSL_CTX = None
+
+
+async def availability_async(ip, timeout, port, sem, req, host):
+    """asyncio 版可用性检查。语义和 availability() 完全一致。"""
+    import asyncio
+    async with sem:
+        w = None
+        try:
+            r, w = await asyncio.wait_for(
+                asyncio.open_connection(ip, int(port or 443),
+                                        ssl=_SSL_CTX, server_hostname=host),
+                timeout=timeout)
+            w.write(req)
+            await w.drain()
+            data = await asyncio.wait_for(r.read(8192), timeout=timeout)
+        except (OSError, asyncio.TimeoutError, ValueError):
+            return None
+        except Exception:                        # noqa: BLE001  ssl 各种异常
+            return None
+        finally:
+            if w is not None:
+                try:
+                    w.close()
+                except OSError:
+                    pass
+
+    info = {}
+    for line in data.decode("utf-8", "replace").splitlines():
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip().lower(), v.strip()
+        if k == "loc":
+            info["cfcountry"] = v.upper()
+        elif k == "colo":
+            info["colo"] = v.upper()
+    return info if info.get("cfcountry") else None
+
+
+def stage1_async(items, concurrency, timeout):
+    """asyncio 版第一阶段。接口和 stage1() 一致，返回通过列表。"""
+    import asyncio
+
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        _SSL_CTX = _ssl_ctx()
+
+    total = len(items)
+    log(f"\n[*] 第一阶段：可用性，{total} IP，asyncio 并发 {concurrency}")
+    host = AVAILABILITY_HOST
+    path = urlparse(AVAILABILITY_URL).path or "/cdn-cgi/trace"
+    req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+           f"User-Agent: cfip/1.0\r\nConnection: close\r\n\r\n").encode()
+
+    # 分批喂给事件循环：一次把 18 万个协程全建出来会吃掉大量内存，
+    # 分批后峰值只跟批大小有关。
+    BATCH = max(concurrency * 4, 1000)
+    out = []
+    done = 0
+
+    async def _batch(chunk):
+        sem = asyncio.Semaphore(concurrency)
+        return await asyncio.gather(*[
+            availability_async(x["ip"], timeout, str(x.get("port") or "443"),
+                               sem, req, host) for x in chunk])
+
+    async def _run():
+        nonlocal done
+        for start in range(0, total, BATCH):
+            chunk = items[start:start + BATCH]
+            results = await _batch(chunk)
+            for x, cf in zip(chunk, results):
+                done += 1
+                addr = x["ip"]
+                port = str(x.get("port") or "443")
+                tag = addr if port == "443" else f"{addr}:{port}"
+                if not cf:
+                    progress("availability", done, total,
+                             f"{tag} | DROP: Cloudflare trace不可用")
+                    continue
+                y = dict(x)
+                y.update(cf)
+                out.append(y)
+                progress("availability", done, total,
+                         f"{tag} | PASS cfcountry={y.get('cfcountry', '')} "
+                         f"colo={y.get('colo', '-')}")
+
+    asyncio.run(_run())
+    log(f"[*] 第一阶段完成：{len(out)}/{total}")
+    return out
+
+
 # ==================== Stage 1 ====================
+# ==================== 原生 socket 实现（替代 curl 子进程）====================
+# 为什么要有这套：
+#   原来每测一个 IP 就 fork+exec 一个 curl。18 万个 IP 就是 18 万次进程创建，
+#   实测在单核 VPS 上进程创建速率 19 个/秒、同时挂着 60 个 curl 进程，
+#   CPU 全耗在 fork/exec 上，吞吐只有 11 个 IP/秒。
+#   改用原生 socket 后没有进程创建，同一个连接流程走完就关，开销只剩网络本身。
+USE_NATIVE_SOCKET = True   # False 就退回 curl（兼容排查用）
+
+
+def _http_get_via(ip, port, host, path, timeout, max_bytes=16384):
+    """对指定 IP 发一个 HTTPS GET，SNI/Host 用 host。返回响应体 bytes 或 None。
+
+    用原生 socket + ssl，不创建子进程。
+    """
+    import socket as _socket
+    import ssl as _ssl
+
+    port = int(port or 443)
+    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+    # 我们连的是任意第三方 IP，证书必然是别人的，所以不校验 ——
+    # 我们要判断的是「这个 IP 有没有把 SNI=host 的流量反代到 CF」，
+    # 而不是「证书对不对」。这跟 curl -k 的行为一致。
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    try:
+        ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+    except _ssl.SSLError:
+        pass
+
+    req = (f"GET {path} HTTP/1.1\r\n"
+           f"Host: {host}\r\n"
+           f"User-Agent: cfip/1.0\r\n"
+           f"Accept: */*\r\n"
+           f"Connection: close\r\n\r\n").encode()
+
+    sock = None
+    try:
+        sock = _socket.create_connection((ip, port), timeout=timeout)
+        sock.settimeout(timeout)
+        tls = ctx.wrap_socket(sock, server_hostname=host)
+        try:
+            tls.sendall(req)
+            buf = bytearray()
+            while len(buf) < max_bytes:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                # 响应头读完、body 够长就可以提前收工（省一个 RTT 的等待）
+                if b"\r\n\r\n" in buf and len(buf) > 256:
+                    break
+        finally:
+            try:
+                tls.close()
+            except OSError:
+                pass
+        raw = bytes(buf)
+    except (OSError, _ssl.SSLError, ValueError):
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    # 去掉响应头，只留 body（Connection: close 也可能是 chunked，做个兜底）
+    idx = raw.find(b"\r\n\r\n")
+    body = raw[idx + 4:] if idx >= 0 else raw
+    if b"transfer-encoding: chunked" in raw[:idx if idx >= 0 else 0].lower():
+        # 简单解码：<hex 长度>\r\n<数据>\r\n...
+        out = bytearray()
+        rest = body
+        while True:
+            nl = rest.find(b"\r\n")
+            if nl < 0:
+                break
+            try:
+                n = int(rest[:nl].split(b";")[0], 16)
+            except ValueError:
+                break
+            if n == 0:
+                break
+            out += rest[nl + 2:nl + 2 + n]
+            rest = rest[nl + 2 + n + 2:]
+        body = bytes(out)
+    return body
+
+
+def availability_native(ip, timeout=CURL_TIMEOUT_SEC, port="443"):
+    """可用性检查的原生实现：连 ip:port，SNI 用 AVAILABILITY_HOST，
+    取 /cdn-cgi/trace，看里面有没有 loc=。"""
+    path = urlparse(AVAILABILITY_URL).path or "/cdn-cgi/trace"
+    body = _http_get_via(ip, port, AVAILABILITY_HOST, path, timeout)
+    if not body:
+        return None
+    info = {}
+    for line in body.decode("utf-8", "replace").splitlines():
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip().lower(), v.strip()
+        if k == "loc":
+            info["cfcountry"] = v.upper()
+        elif k == "colo":
+            info["colo"] = v.upper()
+    return info if info.get("cfcountry") else None
+
+
 def availability(ip, timeout=CURL_TIMEOUT_SEC, port="443"):
     """可用性检查。端口默认 443，也支持 CF 的其它 HTTPS 端口（2053/2083/2087/2096/8443）。
 
     注意 URL 里也要带端口 —— 只改 --resolve 不改 URL 的话，
     curl 还是会去连 443，测出来的结果和端口对不上。
     """
+    if USE_NATIVE_SOCKET:
+        return availability_native(ip, timeout, port)
     port = str(port or "443")
     suffix = "" if port == "443" else f":{port}"
     cmd = ["curl", "-sS", "-k",
@@ -799,6 +1049,8 @@ def availability(ip, timeout=CURL_TIMEOUT_SEC, port="443"):
 
 
 def stage1(items, threads):
+    if USE_ASYNCIO:
+        return stage1_async(items, max(ASYNCIO_CONCURRENCY, threads), CURL_TIMEOUT_SEC)
     total = len(items)
     done = 0
     out = []
@@ -1229,7 +1481,60 @@ def sort_key(r):
             -float(r["speed"]), float(r["latency"]))
 
 
+def _fmt_line(r, rank):
+    route = (r.get("route") or "Unknown").strip()
+    tour = r.get("tour", "None")
+    rd = route if tour == "None" else f"{route}绕" + "、".join(
+        flag(c) for c in tour.split("→"))
+    # 非 443 端口要标出来，否则下游按 443 去连会连不上
+    port = str(r.get("port") or "443")
+    addr = r["ip"] if port == "443" else f"{r['ip']}:{port}"
+    line = f"{addr}#{flag(r.get('country', ''))} ({rd})"
+    city = (r.get("city") or "").strip()
+    if city:
+        line += f" {city}"
+    return line + f" {rank}"
+
+
+def _is_high_end(r):
+    route = (r.get("route") or "Unknown").strip()
+    route_asns = {str(x).replace("AS", "").strip() for x in (r.get("route_asns") or [])}
+    return route in HIGH_END_ROUTE_NAMES or bool(HIGH_END_ASNS.intersection(route_asns))
+
+
+def _write_csv(path, rows):
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "ip", "port", "score", "latency", "loss",
+                    "speed", "cfcountry", "route", "tour", "country", "city"])
+        for i, r in enumerate(rows, 1):
+            w.writerow([i, r["ip"], r.get("port", "443"), f"{ip_score(r):.1f}",
+                        fmt_latency(r["latency"]), fmt_loss(r.get("loss")),
+                        fmt_speed(r["speed"]), r.get("cfcountry", ""),
+                        r.get("route", ""), r.get("tour", "None"),
+                        r.get("country", ""), r.get("city", "")])
+
+
+def _write_txt(path, rows, only_best):
+    lines = []
+    rank = 0
+    for r in rows:
+        if only_best and not _is_high_end(r):
+            continue
+        rank += 1
+        lines.append(_fmt_line(r, rank))
+    with open(path, "w", encoding="utf-8-sig") as f:
+        f.write("\n".join(lines) + ("\n" if lines else ""))
+    return len(lines)
+
+
 def outputs(results, outtxt, outcsv, only_best):
+    """写两套结果。
+
+    第一套（全量）—— 所有通过筛选的 IP，不限制地区。这是主列表。
+    第二套（地区）—— 只保留 OUTPUT_REGIONS 白名单里的地区。
+    两套各有 .txt 和 .csv，Web 面板和 API 分别提供。
+    """
     results = sorted(results, key=sort_key)
 
     # Top-N：只留排名最靠前的 N 个。推 DNS 分流用不了几百个，
@@ -1239,42 +1544,34 @@ def outputs(results, outtxt, outcsv, only_best):
             f"（排序模式 {SORT_MODE}）")
         results = results[:TOP_N]
 
-    with open(outcsv, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["rank", "ip", "port", "score", "latency", "loss",
-                    "speed", "cfcountry", "route", "tour", "country", "city"])
-        for i, r in enumerate(results, 1):
-            w.writerow([i, r["ip"], r.get("port", "443"), f"{ip_score(r):.1f}",
-                        fmt_latency(r["latency"]), fmt_loss(r.get("loss")),
-                        fmt_speed(r["speed"]), r.get("cfcountry", ""),
-                        r.get("route", ""), r.get("tour", "None"),
-                        r.get("country", ""), r.get("city", "")])
-    log(f"[*] CSV已保存：{outcsv}")
+    # ---------- 第一套：全量，不限制地区 ----------
+    _write_csv(outcsv, results)
+    n_all = _write_txt(outtxt, results, only_best)
+    log(f"[*] [全量] {outtxt}（{n_all} 条）  {outcsv}")
 
-    lines = []
-    rank = 0
+    # ---------- 第二套：只要白名单地区 ----------
+    if not OUTPUT_SPLIT:
+        return
+    want = {x.strip().upper() for x in re.split(r"[,;\s]+", OUTPUT_REGIONS) if x.strip()}
+    if not want:
+        log("[*] OUTPUT_REGIONS 为空，跳过地区列表")
+        return
+    sub = [r for r in results if (r.get("country") or "").strip().upper() in want]
+    tag = "".join(sorted(want)).lower()
+    sub_txt = re.sub(r"\.txt$", "", outtxt) + f"-{tag}.txt"
+    sub_csv = re.sub(r"\.csv$", "", outcsv) + f"-{tag}.csv"
+    _write_csv(sub_csv, sub)
+    n_sub = _write_txt(sub_txt, sub, only_best)
+    log(f"[*] [地区 {','.join(sorted(want))}] {sub_txt}（{n_sub} 条）  {sub_csv}")
+
+    # 顺便打一份地区分布，方便一眼看出哪个地区多
+    dist = {}
     for r in results:
-        route = (r.get("route") or "Unknown").strip()
-        route_asns = {str(x).replace("AS", "").strip() for x in (r.get("route_asns") or [])}
-        is_high_end = route in HIGH_END_ROUTE_NAMES or bool(HIGH_END_ASNS.intersection(route_asns))
-        if only_best and not is_high_end:
-            continue
-
-        rank += 1
-        tour = r.get("tour", "None")
-        rd = route if tour == "None" else f"{route}绕" + "、".join(flag(c) for c in tour.split("→"))
-        # 非 443 端口要标出来，否则下游按 443 去连会连不上
-        port = str(r.get("port") or "443")
-        addr = r["ip"] if port == "443" else f"{r['ip']}:{port}"
-        line = f"{addr}#{flag(r.get('country', ''))} ({rd})"
-        city = (r.get("city") or "").strip()
-        if city:
-            line += f" {city}"
-        lines.append(line + f" {rank}")
-
-    with open(outtxt, "w", encoding="utf-8-sig") as f:
-        f.write("\n".join(lines) + ("\n" if lines else ""))
-    log(f"[*] ip.txt已保存：{outtxt}（{len(lines)} 条）")
+        cc = (r.get("country") or "??").upper()
+        dist[cc] = dist.get(cc, 0) + 1
+    if dist:
+        top = sorted(dist.items(), key=lambda kv: -kv[1])[:12]
+        log("[*] 地区分布：" + "  ".join(f"{c}={n}" for c, n in top))
 
 
 # ==================== Main ====================

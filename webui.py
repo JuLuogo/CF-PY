@@ -18,6 +18,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -82,12 +83,63 @@ def load_status():
     return st
 
 
+def _region_tag():
+    """第二套列表的地区后缀（和 ip.py 里生成的保持一致）。"""
+    try:
+        import ip as _ip
+        cfg = _ip.load_config(CONFIG_PATH)
+        raw = str(cfg.get("OUTPUT_REGIONS") or "").strip().strip('"')
+        want = sorted({x.strip().upper() for x in re.split(r"[,;\s]+", raw) if x.strip()})
+        return "".join(want).lower(), want
+    except Exception:                            # noqa: BLE001
+        return "", []
+
+
 def load_results():
     try:
         import fetch_ips as ff
         return ff.read_final_summary(limit=300)
     except Exception as e:                       # noqa: BLE001
         return {"error": str(e), "ip_txt": [], "rows": []}
+
+
+def load_results_region():
+    """读第二套（只含白名单地区）的结果文件。"""
+    tag, want = _region_tag()
+    out = {"tag": tag, "regions": want, "ip_txt": [], "rows": [], "exists": False}
+    if not tag:
+        return out
+    # ip.txt -> ip-<tag>.txt；bestips-*.csv -> bestips-*-<tag>.csv
+    for cand in (os.path.join(HERE, f"ip-{tag}.txt"),):
+        if os.path.exists(cand):
+            try:
+                with open(cand, "r", encoding="utf-8-sig", errors="replace") as f:
+                    out["ip_txt"] = [ln for ln in f.read().splitlines() if ln.strip()]
+                out["exists"] = True
+            except OSError:
+                pass
+    # 找最新的地区 CSV
+    best, best_mt = None, 0.0
+    if os.path.isdir(LOG_DIR):
+        for dirpath, _d, files in os.walk(LOG_DIR):
+            for fn in files:
+                if fn.startswith("bestips") and fn.endswith(f"-{tag}.csv"):
+                    p = os.path.join(dirpath, fn)
+                    try:
+                        mt = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    if mt > best_mt:
+                        best, best_mt = p, mt
+    if best:
+        try:
+            import csv as _csv
+            with open(best, "r", encoding="utf-8-sig", errors="replace") as f:
+                out["rows"] = list(_csv.DictReader(f))
+            out["exists"] = True
+        except OSError:
+            pass
+    return out
 
 
 def tail_log(lines=200):
@@ -175,6 +227,9 @@ def serve_ips(qs):
       max_loss=5           丢包率上限 %
       min_speed=1          速度下限 MB/s
       country=HK,JP        只要这些地区
+    两套数据（set=）：
+      all     所有可用 IP，不限制地区（默认）—— /api/ips
+      region  只含 OUTPUT_REGIONS 白名单里的地区 —— /api/ips?set=region
     """
     fmt = (qs.get("format") or ["text"])[0].lower()
     limit = int((qs.get("limit") or ["200"])[0])
@@ -183,7 +238,14 @@ def serve_ips(qs):
     min_speed = _num((qs.get("min_speed") or [""])[0])
     want_cc = {c.strip().upper() for c in (qs.get("country") or [""])[0].split(",") if c.strip()}
 
-    res = load_results()
+    which = (qs.get("set") or ["all"])[0].lower()
+    if which in ("region", "regions", "area", "cn", "filtered"):
+        res = load_results_region()
+        if not res.get("exists"):
+            return {"error": "还没有地区列表。等一轮跑完，或检查 OUTPUT_REGIONS 配置",
+                    "set": "region", "regions": res.get("regions") or []}
+    else:
+        res = load_results()
     rows = res.get("rows") or []
 
     # 没有 CSV（比如只跑了 -stage1）就退回 ip.txt，直接给纯 IP
@@ -530,21 +592,31 @@ PAGE = r"""<!DOCTYPE html>
 <div class="sub" id="sub">加载中…</div>
 
 <div class="card">
-  <div class="row" style="margin:0 0 8px">
+  <div class="row" style="margin:0 0 10px">
     <button id="run">立即跑一轮</button>
     <button class="gray" id="refresh">刷新</button>
     <span id="runmsg" class="sub" style="margin:0"></span>
   </div>
-  <div class="k" id="stageName">当前阶段：—</div>
-  <div class="bar"><i id="bar"></i></div>
-  <div class="hint" id="stageInfo">—</div>
+  <div id="progwrap"><div class="hint">还没有进度信息（等扫描跑起来）</div></div>
 </div>
 
 <div class="grid" id="stats"></div>
 
 <div class="card">
-  <h2>优选结果 <span class="k" id="resCount"></span></h2>
-  <div class="scroll"><table id="res"><thead><tr>
+  <h2>优选结果 · 全量 <span class="k" id="resCountAll"></span></h2>
+  <div class="hint" style="margin-bottom:8px">所有可用 IP，<b>不限制地区</b>。下游服务用 <code>/api/ips</code> 取这一套。</div>
+  <div class="scroll"><table id="resAll"><thead><tr>
+    <th>#</th><th>IP</th><th>端口</th><th>评分</th><th>延迟</th><th>丢包</th><th>速度</th><th>线路</th><th>地区</th><th>城市</th>
+  </tr></thead><tbody></tbody></table></div>
+</div>
+
+<div class="card">
+  <h2>优选结果 · 地区版 <span class="k" id="resCountRegion"></span></h2>
+  <div class="hint" style="margin-bottom:8px">
+    只含白名单地区的 IP（在下面「筛选与排序」里配 <code>OUTPUT_REGIONS</code>）。
+    下游服务用 <code>/api/ips?set=region</code> 取这一套。
+  </div>
+  <div class="scroll"><table id="resRegion"><thead><tr>
     <th>#</th><th>IP</th><th>端口</th><th>评分</th><th>延迟</th><th>丢包</th><th>速度</th><th>线路</th><th>地区</th><th>城市</th>
   </tr></thead><tbody></tbody></table></div>
 </div>
@@ -776,7 +848,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(load_status())
         if u.path == "/api/results":
             return self._json(load_results())
+        if u.path == "/api/results/region":
+            return self._json(load_results_region())
         if u.path == "/api/ips":
+            fmt = (qs.get("format") or ["text"])[0].lower()
+            ctype = {"json": "application/json; charset=utf-8",
+                     "csv": "text/csv; charset=utf-8"}.get(fmt, "text/plain; charset=utf-8")
+            body = serve_ips(qs)
+            if isinstance(body, dict):
+                return self._json(body)
+            return self._send(200, body, ctype)
+        if u.path == "/api/ips/region":
+            # 等价的便捷写法：/api/ips/region == /api/ips?set=region
+            qs = dict(qs)
+            qs["set"] = ["region"]
             fmt = (qs.get("format") or ["text"])[0].lower()
             ctype = {"json": "application/json; charset=utf-8",
                      "csv": "text/csv; charset=utf-8"}.get(fmt, "text/plain; charset=utf-8")
