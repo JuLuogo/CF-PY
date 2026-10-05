@@ -338,6 +338,13 @@ NoNewPrivileges=true
 # 并发连接要占 fd。有些发行版 systemd 默认 DefaultLimitNOFILE=1024，
 # 那样 stage0 高并发时 socket 开不出来，会静默丢命中（实测丢 90%）。
 LimitNOFILE=65535
+# 内存和 OOM 保护：万一脚本出问题把内存吃光，
+# 也要保证【先杀 cfip，而不是 sshd】—— 否则 SSH 进不去只能硬重启（实测踩过）。
+# MemoryMax 是硬上限，超了 systemd 直接杀这个服务；
+# MemoryHigh 是软上限，超了开始回收。
+MemoryHigh=350M
+MemoryMax=500M
+OOMScoreAdjust=500
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cfip

@@ -541,6 +541,61 @@ def test_skipped_stages():
     check("当前任务不选已跳过的阶段", "!p.skipped" in w)
 
 
+
+
+# ---------------------------------------------------------------- 18. 系统资源保护
+def test_resource_guard():
+    """实测踩过最严重的一次：扫描把 726MB 的机器榨干，
+    SSH 连上立刻被断开，只能硬重启。
+
+    根因：内核给每个 socket 默认预留 208KB 收 + 208KB 发缓冲，
+    3000 并发 = 1.2GB 内核内存。这些内存在内核 slab 里【不算进进程 RSS】，
+    所以 OOM killer 不一定触发，但内核已经分配不出内存给 sshd。
+    """
+    ip_src = open(os.path.join(ROOT, "ip.py"), encoding="utf-8").read()
+    f_src = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    sh = open(os.path.join(ROOT, "install.sh"), encoding="utf-8").read()
+
+    # 1) socket 缓冲必须显式压小
+    check("有 socket 缓冲上限", "SOCK_BUF_BYTES" in ip_src)
+    check("连接时会设置缓冲", "def _tune_sock" in ip_src)
+    check("asyncio 路径也设置", "def _tune_asyncio_sock" in ip_src)
+    # asyncio 必须先裸连->设缓冲->再包 TLS，否则没机会设
+    check("asyncio 走 start_tls 两步", "def _start_tls" in ip_src)
+
+    # 2) 资源看门狗
+    check("有内存查询", "def mem_available_mb" in f_src)
+    check("有并发封顶", "def safe_concurrency" in f_src)
+    check("有资源等待", "def sys_guard" in f_src)
+    check("流水线里调用了看门狗", 'sys_guard(f"ASN' in f_src)
+    # 内核 socket 表也要纳入封顶
+    check("按孤儿 socket 表封顶", "tcp_max_orphans" in f_src)
+    check("按临时端口封顶", "_port_range_size" in f_src)
+
+    # 3) 默认并发不能太大
+    import re
+    m = re.search(r"^STAGE0_CONCURRENCY = (\d+)", ip_src, re.M)
+    check("stage0 默认并发 <= 1000", bool(m) and int(m.group(1)) <= 1000,
+          f"实际 {m.group(1) if m else '?'}")
+    m2 = re.search(r"^ASYNCIO_CONCURRENCY = (\d+)", ip_src, re.M)
+    check("stage1 默认并发 <= 500", bool(m2) and int(m2.group(1)) <= 500,
+          f"实际 {m2.group(1) if m2 else '?'}")
+
+    # 4) systemd 保护：cfip 必须先死，sshd 活着
+    check("unit 有 MemoryMax", "MemoryMax=" in sh)
+    check("unit 有 OOMScoreAdjust", "OOMScoreAdjust=" in sh)
+    check("unit 有 LimitNOFILE", "LimitNOFILE=" in sh)
+
+    # 5) 内核参数调优脚本
+    tune = os.path.join(ROOT, "tune-sysctl.sh")
+    check("有 tune-sysctl.sh", os.path.exists(tune))
+    if os.path.exists(tune):
+        tc = open(tune, encoding="utf-8").read()
+        check("调优脚本含 tcp_max_orphans", "tcp_max_orphans" in tc)
+        check("调优脚本含临时端口范围", "ip_local_port_range" in tc)
+        check("调优脚本限制 journal 大小", "SystemMaxUse" in tc)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  回归测试")
@@ -550,7 +605,8 @@ if __name__ == "__main__":
                test_undefined_globals, test_streaming_sampling,
                test_once_semantics, test_two_datasets, test_progress_keys,
                test_no_bulk_candidate_file, test_pool_safety,
-               test_port_protocols, test_resume, test_skipped_stages):
+               test_port_protocols, test_resume, test_skipped_stages,
+               test_resource_guard):
         print(f"\n[{fn.__name__}] {fn.__doc__.splitlines()[0] if fn.__doc__ else ''}")
         try:
             fn()

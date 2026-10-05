@@ -262,6 +262,7 @@ def apply_config(cfg):
     global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
     global THREADS, LOOP
     global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE, FULL_SCAN, SUB_BATCH
+    global SYS_GUARD_ENABLED, SYS_MIN_FREE_MB, PER_CONN_KB
     global POOL_ENABLED, POOL_FILE, POOL_MAX_AGE_DAYS, POOL_MIN_KEEP_RATIO
     global UPSTREAM_STAGE1_ONLY, POOL_MODE
 
@@ -310,6 +311,12 @@ def apply_config(cfg):
     if "PORTS" in cfg:                PORTS = str(get("PORTS") or "").strip()
     if "CHUNK_SIZE" in cfg:          CHUNK_SIZE = as_int(get("CHUNK_SIZE"), CHUNK_SIZE)
     if "SUB_BATCH" in cfg:            SUB_BATCH = max(1000, as_int(get("SUB_BATCH"), SUB_BATCH))
+    if "SYS_GUARD_ENABLED" in cfg:
+        SYS_GUARD_ENABLED = as_bool(get("SYS_GUARD_ENABLED"), SYS_GUARD_ENABLED)
+    if "SYS_MIN_FREE_MB" in cfg:
+        SYS_MIN_FREE_MB = max(50, as_int(get("SYS_MIN_FREE_MB"), SYS_MIN_FREE_MB))
+    if "PER_CONN_KB" in cfg:
+        PER_CONN_KB = max(16, as_int(get("PER_CONN_KB"), PER_CONN_KB))
     if "FULL_SCAN" in cfg:            FULL_SCAN = as_bool(get("FULL_SCAN"), FULL_SCAN)
     if "POOL_ENABLED" in cfg:         POOL_ENABLED = as_bool(get("POOL_ENABLED"), POOL_ENABLED)
     if "POOL_FILE" in cfg:            POOL_FILE = str(get("POOL_FILE") or POOL_FILE).strip().strip('"')
@@ -2156,6 +2163,115 @@ def read_final_summary(limit=200):
 # 峰值内存 = 单个 ASN 的候选数（最大约 12 万个，约 30MB）。
 
 
+# ==================== 系统资源看门狗 ====================
+# 实测踩过：扫描把 726MB 的机器榨干，SSH 连上立刻被断开，
+# 只能硬重启。事后查内核日志是 OOM（cfip 的 python3 吃了 600MB）。
+# 光靠降并发不够 —— 得让脚本自己知道「系统快撑不住了」，主动让路。
+#
+# 两道闸：
+#   1. 内存闸：可用内存低于阈值就暂停，等它回升
+#   2. 并发闸：按可用内存给并发数封顶，不让人手填的大数字生效
+SYS_GUARD_ENABLED = True
+SYS_MIN_FREE_MB = 150        # 可用内存低于这个值就暂停（给 sshd 留活路）
+SYS_GUARD_MAX_WAIT = 900     # 最多等这么久（秒），超了也继续（免得永久卡住）
+# 每个并发连接的内核内存预算（KB）。socket 缓冲压到 16KB 后，
+# 收发各 16KB + 内核结构约 8KB ≈ 40KB。取 64KB 留余量。
+PER_CONN_KB = 64
+# 并发上限还要受临时端口数约束（每次连接占一个）
+MAX_PORT_FRACTION = 0.5      # 最多用一半临时端口，留一半给系统自己
+
+
+def mem_available_mb():
+    """系统可用内存（MB）。Linux 读 /proc/meminfo，其他平台返回 None。"""
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii", errors="replace") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _port_range_size():
+    """临时端口总数（决定并发上限）。"""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range", "r") as f:
+            lo, hi = (int(x) for x in f.read().split()[:2])
+        return hi - lo + 1
+    except (OSError, ValueError):
+        return 28232
+
+
+def safe_concurrency(requested):
+    """按可用内存和临时端口给并发数封顶。
+
+    返回 (最终并发, 说明)。人手填太大时会被自动压下来并打日志 ——
+    宁可慢一点，也不能把机器搞到连不上。
+    """
+    if not SYS_GUARD_ENABLED:
+        return requested, "看门狗已关闭"
+    notes = []
+    cap = requested
+
+    mem = mem_available_mb()
+    if mem is not None:
+        # 只让扫描用「可用内存 - 保留量」这部分
+        usable = max(0, mem - SYS_MIN_FREE_MB)
+        by_mem = int(usable * 1024 / PER_CONN_KB)
+        if by_mem < cap:
+            notes.append(f"内存 {mem:.0f}MB 可用 -> 最多 {by_mem}")
+            cap = by_mem
+
+    ports = _port_range_size()
+    by_port = int(ports * MAX_PORT_FRACTION)
+    if by_port < cap:
+        notes.append(f"临时端口 {ports} 个 -> 最多 {by_port}")
+        cap = by_port
+
+    # 内核 socket 表限制。这两个默认值很多系统只有 4096：
+    #   tcp_max_orphans   —— 孤儿 socket 上限，超了内核直接 RST 并告警
+    #   tcp_max_tw_buckets—— TIME_WAIT 桶上限，超了立刻回收
+    # 并发超过它们的一半就很容易触发，所以按一半封顶。
+    for key, label in (("net.ipv4.tcp_max_orphans", "孤儿 socket"),
+                       ("net.ipv4.tcp_max_tw_buckets", "TIME_WAIT 桶")):
+        v = _read_sysctl_int(key)
+        if v:
+            by_kernel = int(v * 0.5)
+            if by_kernel < cap:
+                notes.append(f"{label}上限 {v} -> 最多 {by_kernel}")
+                cap = by_kernel
+
+    cap = max(50, cap)          # 再保守也别低于 50，否则没法干活
+    return cap, "；".join(notes) if notes else ""
+
+
+def _read_sysctl_int(key):
+    try:
+        with open("/proc/sys/" + key.replace(".", "/"), "r") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def sys_guard(tag=""):
+    """等系统缓过来再继续。返回等了多久（秒）。"""
+    if not SYS_GUARD_ENABLED:
+        return 0
+    waited = 0
+    while waited < SYS_GUARD_MAX_WAIT:
+        mem = mem_available_mb()
+        if mem is None or mem >= SYS_MIN_FREE_MB:
+            return waited
+        if waited == 0:
+            log(f"[!] 可用内存只剩 {mem:.0f}MB（低于 {SYS_MIN_FREE_MB}MB），"
+                f"暂停扫描让系统缓一缓{('（' + tag + '）') if tag else ''}")
+        time.sleep(15)
+        waited += 15
+    log(f"[!] 等了 {waited} 秒内存还没回来，继续扫描（可能一直卡着）")
+    return waited
+
+
 # ==================== 断点续跑 ====================
 # vps 档位全量要跑 12 小时。用户的机器实测崩过 7 次（磁盘写满那次），
 # 一次意外重启就前功尽弃 —— 12 小时的扫描白跑。
@@ -2315,16 +2431,25 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
             if not kept:
                 continue
 
+            # 每处理一个 ASN 前检查系统资源 —— 撑不住就先让路
+            sys_guard(f"ASN {asn}")
+
             # stage0：TCP 预筛（把黑洞筛掉）
             alive = kept
             if ipt.STAGE0_ENABLED:
-                alive = ipt.stage0_tcp_filter(kept, ipt.STAGE0_TIMEOUT, ipt.STAGE0_CONCURRENCY)
+                conc, why = safe_concurrency(ipt.STAGE0_CONCURRENCY)
+                if conc < ipt.STAGE0_CONCURRENCY:
+                    log(f"[!] stage0 并发从 {ipt.STAGE0_CONCURRENCY} 压到 {conc}（{why}）")
+                alive = ipt.stage0_tcp_filter(kept, ipt.STAGE0_TIMEOUT, conc)
                 del kept
                 if not alive:
                     continue
 
             # stage1：可用性（确认是不是真反代）
-            passed = ipt.stage1_async(alive, ipt.ASYNCIO_CONCURRENCY, ipt.CURL_TIMEOUT_SEC)
+            conc1, why1 = safe_concurrency(ipt.ASYNCIO_CONCURRENCY)
+            if conc1 < ipt.ASYNCIO_CONCURRENCY:
+                log(f"[!] stage1 并发从 {ipt.ASYNCIO_CONCURRENCY} 压到 {conc1}（{why1}）")
+            passed = ipt.stage1_async(alive, conc1, ipt.CURL_TIMEOUT_SEC)
             del alive
 
             # 只把通过的写盘

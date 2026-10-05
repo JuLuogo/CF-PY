@@ -323,7 +323,7 @@ def load_config(path):
 def apply_config(cfg):
     global token, downloadBytes, previousCountry, hops, ONLY_OUTPUT_BEST_ROUTE
     global OUTPUT_REGIONS, OUTPUT_SPLIT
-    global USE_NATIVE_SOCKET, EXTRA_HTTP_PORTS
+    global USE_NATIVE_SOCKET, EXTRA_HTTP_PORTS, SOCK_BUF_BYTES, SOCK_BUF_ENABLED
     global USE_ASYNCIO, ASYNCIO_CONCURRENCY
     global STAGE0_ENABLED, STAGE0_TIMEOUT, STAGE0_CONCURRENCY
     global DEFAULT_INPUT, DEFAULT_IP_OUTPUT, DEFAULT_CSV_OUTPUT, OUTPUT_FOLDER_PATH
@@ -366,6 +366,10 @@ def apply_config(cfg):
     if "HTTP_PORTS" in cfg:
         EXTRA_HTTP_PORTS = {int(x) for x in re.split(r"[,;\s]+", str(cfg["HTTP_PORTS"]).strip().strip('"'))
                             if x.strip().isdigit()}
+    if "SOCK_BUF_BYTES" in cfg:
+        SOCK_BUF_BYTES = max(2048, int(cfg["SOCK_BUF_BYTES"]))
+    if "SOCK_BUF_ENABLED" in cfg:
+        SOCK_BUF_ENABLED = bool(cfg["SOCK_BUF_ENABLED"])
     if "USE_ASYNCIO" in cfg:
         USE_ASYNCIO = bool(cfg["USE_ASYNCIO"])
     if "STAGE0_ENABLED" in cfg:
@@ -858,7 +862,10 @@ def submit_batched(ex, fn, items, batch=TASK_BATCH):
 # 端口开着但不是反代的 IP 依然会被 stage1 淘汰，只是不用在 stage0 就淘汰。
 STAGE0_ENABLED = True
 STAGE0_TIMEOUT = 1.5        # 秒。黑洞靠这个值淘汰，调小更快但可能误杀慢线路
-STAGE0_CONCURRENCY = 3000   # 纯 TCP 连接很轻，可以比 stage1 开得高得多
+STAGE0_CONCURRENCY = 800    # 纯 TCP 连接很轻，但别开太大 ——
+                            # 实测 3000 并发时内核 socket 缓冲吃掉 1.2GB，
+                            # 726MB 的机器被榨干，SSH 都连不上。
+                            # 会被 fetch_ips.safe_concurrency() 按内存和内核表再压一次。
 
 
 async def _tcp_probe(addr, port, sem, timeout):
@@ -924,6 +931,35 @@ USE_ASYNCIO = True          # False 就退回线程池
 ASYNCIO_CONCURRENCY = 300   # 单核建议 200~500；线程池模式别开这么高
 
 
+def _tune_asyncio_sock(writer):
+    """给 asyncio 的底层 socket 压缓冲。"""
+    if not SOCK_BUF_ENABLED:
+        return
+    import socket as _socket
+    try:
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            for opt in (_socket.SO_RCVBUF, _socket.SO_SNDBUF):
+                try:
+                    sock.setsockopt(_socket.SOL_SOCKET, opt, SOCK_BUF_BYTES)
+                except OSError:
+                    pass
+    except Exception:                            # noqa: BLE001
+        pass
+
+
+async def _start_tls(reader, writer, host):
+    """在已建立的裸连接上做 TLS 握手，返回新的 (reader, writer)。"""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    transport = writer.transport
+    protocol = transport.get_protocol()
+    new_transport = await loop.start_tls(
+        transport, protocol, _SSL_CTX, server_hostname=host)
+    protocol._transport = new_transport
+    return reader, writer
+
+
 def _ssl_ctx():
     import ssl as _ssl
     c = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
@@ -951,15 +987,18 @@ async def availability_async(ip, timeout, port, sem, req, host):
     async with sem:
         w = None
         try:
+            # 关键：先建裸连接 -> 压缓冲 -> 再包 TLS。
+            # asyncio.open_connection(ssl=...) 会一次性做完，没机会插进去设缓冲。
             if use_tls:
+                raw_r, raw_w = await asyncio.wait_for(
+                    asyncio.open_connection(ip, int(port or 443)), timeout=timeout)
+                _tune_asyncio_sock(raw_w)
                 r, w = await asyncio.wait_for(
-                    asyncio.open_connection(ip, int(port or 443),
-                                            ssl=_SSL_CTX, server_hostname=host),
-                    timeout=timeout)
+                    _start_tls(raw_r, raw_w, host), timeout=timeout)
             else:
                 r, w = await asyncio.wait_for(
-                    asyncio.open_connection(ip, int(port or 80)),
-                    timeout=timeout)
+                    asyncio.open_connection(ip, int(port or 80)), timeout=timeout)
+                _tune_asyncio_sock(w)
             w.write(req)
             await w.drain()
             data = await asyncio.wait_for(r.read(8192), timeout=timeout)
@@ -1049,6 +1088,18 @@ def stage1_async(items, concurrency, timeout):
 #   改用原生 socket 后没有进程创建，同一个连接流程走完就关，开销只剩网络本身。
 USE_NATIVE_SOCKET = True   # False 就退回 curl（兼容排查用）
 
+# ==================== socket 缓冲区上限（关键）====================
+# 内核给每个 TCP socket 默认预留 208KB 收 + 208KB 发 = 416KB。
+# 并发 3000 时就是 3000 x 416KB = 【1.2 GB 内核内存】——
+# 而用户的机器总共只有 726MB。这些内存在内核 slab 里，不算进进程 RSS，
+# 所以 OOM killer 不一定触发，但内核已经分配不出内存给 sshd，
+# 表现就是「SSH 连上立刻被断开」（实测踩过，重启才恢复）。
+#
+# 我们每次只交换几百字节的 HTTP 响应，8KB 缓冲完全够。
+# 显式设小之后每连接内核内存从 416KB 降到 16KB，降 26 倍。
+SOCK_BUF_BYTES = 16384      # 收发各 16KB（内核会翻倍，实际约 32KB/连接）
+SOCK_BUF_ENABLED = True
+
 # CF 的端口分两类，必须走不同协议 —— 拿 HTTPS 去连 80 永远连不通。
 #   HTTPS: 443 2053 2083 2087 2096 8443
 #   HTTP : 80  8080 8880 2052 2082 2086 2095
@@ -1072,6 +1123,21 @@ def port_uses_http(port):
     if p in CF_HTTPS_PORTS:
         return False
     return False              # 非标端口默认按 HTTPS
+
+
+def _tune_sock(sock):
+    """把 socket 收发缓冲压到 SOCK_BUF_BYTES。
+
+    必须在 connect 之后、发数据之前调 —— 太晚内核已经按默认值分配了。
+    """
+    if not SOCK_BUF_ENABLED:
+        return
+    import socket as _socket
+    for opt in (_socket.SO_RCVBUF, _socket.SO_SNDBUF):
+        try:
+            sock.setsockopt(_socket.SOL_SOCKET, opt, SOCK_BUF_BYTES)
+        except OSError:
+            pass
 
 
 def _http_get_via(ip, port, host, path, timeout, max_bytes=16384, use_tls=True):
@@ -1106,6 +1172,7 @@ def _http_get_via(ip, port, host, path, timeout, max_bytes=16384, use_tls=True):
     try:
         sock = _socket.create_connection((ip, port), timeout=timeout)
         sock.settimeout(timeout)
+        _tune_sock(sock)
         tls = ctx.wrap_socket(sock, server_hostname=host)
         try:
             tls.sendall(req)
@@ -1169,6 +1236,7 @@ def _http_get_plain(ip, port, host, path, timeout, max_bytes=16384):
     try:
         sock = _socket.create_connection((ip, port), timeout=timeout)
         sock.settimeout(timeout)
+        _tune_sock(sock)
         sock.sendall(req)
         buf = bytearray()
         while len(buf) < max_bytes:
