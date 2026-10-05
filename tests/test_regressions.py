@@ -744,6 +744,28 @@ def test_pipeline_smoke():
             shutil.move(backup, out)
 
 
+
+
+# ---------------------------------------------------------------- 22. 增量写池子
+def test_incremental_pool():
+    """一轮 24 小时，如果等整轮跑完才写池子：
+       - 下游这 24 小时拿到的都是旧数据
+       - 中途崩了这一轮就全白费
+    所以每测完一批就要把新发现并进池子（用户提的「流式传输」）。
+    """
+    f = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    check("流水线支持 on_found 回调", "on_found=None" in f)
+    check("每批结束后调回调", "on_found(fresh)" in f)
+    check("run_once 传了增量回调", "on_found=_on_found" in f)
+    check("增量写用并集（不删旧的）", "update_pool(rows, complete=False)" in f)
+    check("增量写有节流", "_inc['t']" in f or "_inc" in f)
+    # 批次大小要小一点，结果才来得快
+    import re
+    m = re.search(r"^PREFIX_MIN_BATCH = (\d+)", f, re.M)
+    check("批次 <= 4000（结果来得快）", bool(m) and int(m.group(1)) <= 4000,
+          f"实际 {m.group(1) if m else '?'}")
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  回归测试")
@@ -755,7 +777,8 @@ if __name__ == "__main__":
                test_no_bulk_candidate_file, test_pool_safety,
                test_port_protocols, test_resume, test_skipped_stages,
                test_resource_guard, test_critical_functions_exist,
-               test_four_level_progress, test_pipeline_smoke):
+               test_four_level_progress, test_pipeline_smoke,
+               test_incremental_pool):
         print(f"\n[{fn.__name__}] {fn.__doc__.splitlines()[0] if fn.__doc__ else ''}")
         try:
             fn()

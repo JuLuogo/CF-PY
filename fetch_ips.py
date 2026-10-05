@@ -941,7 +941,9 @@ CHUNK_SIZE = 20000
 SUB_BATCH = 50000
 # 逐网段处理时，小网段合并到至少这么多候选再一起测。
 # 一个 /24 只有 254 个 IP，用 800 并发去跑它并发根本用不满。
-PREFIX_MIN_BATCH = 4000
+# 2000 个候选：800 并发跑 stage0 约 4 秒就出一批结果，
+# 配合 on_found 回调，池子能持续被喂新数据。
+PREFIX_MIN_BATCH = 2000
 
 # ==================== 全量扫描 ====================
 # 每个 /24 是 254 个独立主机（unicast），不是 anycast。
@@ -2509,7 +2511,14 @@ def clear_scan_state():
         pass
 
 
-def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
+def run_asn_pipeline(asns, sample, extra_run_args, round_no=1, on_found=None):
+    """逐网段完成「生成 -> 预筛 -> 可用性检查」，结果追加到 STAGE1_CSV。
+
+    on_found: 可选回调。每测完一批就把【新找到的真反代】交给它，
+              调用方可以立刻写进池子 —— 不用等整轮跑完（一轮 24 小时，
+              等完再写的话下游这 24 小时拿到的都是旧数据，
+              而且第 23 小时崩了就全白费）。
+    """
     """逐网段完成「生成 -> 预筛 -> 可用性检查」，结果追加到 STAGE1_CSV。
 
     进度分四级报给面板，层层展开：
@@ -2747,6 +2756,7 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
             passed = process_batch(batch, label, asn, prov, prefix)
             del batch
 
+            fresh = []
             for r in passed:
                 key = "%s:%s" % (r["ip"], r.get("port", "443"))
                 if key in seen_keys:
@@ -2755,12 +2765,23 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
                 wr.writerow([r["ip"], r.get("port", "443"), "https",
                              r.get("cfcountry", ""), r.get("colo", "")])
                 found += 1
+                fresh.append({"ip": r["ip"], "port": r.get("port", "443"),
+                              "cfcountry": r.get("cfcountry", ""),
+                              "colo": r.get("colo", "")})
             fh.flush()
             del passed
+            # 立刻把这批新发现交给调用方（写池子），不等整轮结束
+            if fresh and on_found is not None:
+                try:
+                    on_found(fresh)
+                except Exception as e:           # noqa: BLE001
+                    log(f"[!] 增量写池子失败（不影响扫描）：{e}")
+            del fresh
 
         # 循环结束：冲掉最后一批 + 落最后一个 ASN 的断点
         if pending:
             passed = process_batch(pending, "最后一批", last_asn or "", "", "")
+            fresh = []
             for r in passed:
                 key = "%s:%s" % (r["ip"], r.get("port", "443"))
                 if key in seen_keys:
@@ -2769,7 +2790,16 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
                 wr.writerow([r["ip"], r.get("port", "443"), "https",
                              r.get("cfcountry", ""), r.get("colo", "")])
                 found += 1
+                fresh.append({"ip": r["ip"], "port": r.get("port", "443"),
+                              "cfcountry": r.get("cfcountry", ""),
+                              "colo": r.get("colo", "")})
             fh.flush()
+            if fresh and on_found is not None:
+                try:
+                    on_found(fresh)
+                except Exception as e:           # noqa: BLE001
+                    log(f"[!] 增量写池子失败（不影响扫描）：{e}")
+            del fresh
         if last_asn is not None:
             done_asns.add(last_asn)
             flush_state()
@@ -3087,7 +3117,23 @@ def run_once(a, source, extra_run_args, round_no=1, loop_secs=0):
 
         # ---- 逐 ASN 端到端处理，不落地大文件 ----
         # 原来先把所有候选写 ip.csv（vps 全量要 10GB），磁盘只有 3GB，实测崩了 7 次。
-        found, complete = run_asn_pipeline(asns, ASN_SAMPLE, extra_run_args, round_no)
+        # 增量写池子：每测完一批就把新发现并进去。
+        # 一轮 24 小时，等整轮跑完再写的话下游这 24 小时拿到的都是旧数据；
+        # 而且中途崩了这一轮就全白费。
+        # 节流：最多每 30 秒写一次盘（池子大了每次读+写要几 MB）。
+        _inc = {'t': 0.0, 'n': 0}
+
+        def _on_found(rows):
+            now = time.time()
+            _inc['n'] += len(rows)
+            if now - _inc['t'] < 30.0 and _inc['n'] < 100:
+                return
+            _inc['t'] = now
+            _inc['n'] = 0
+            update_pool(rows, complete=False)   # 并集，只增不减
+
+        found, complete = run_asn_pipeline(asns, ASN_SAMPLE, extra_run_args, round_no,
+                                           on_found=_on_found)
         write_status(candidates=found, kept=found, source="asn",
                      asns=ASNS, asn_sample=ASN_SAMPLE, phase="fetched")
 
