@@ -2571,6 +2571,15 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
         clear_scan_state()
 
     resuming = bool(done_asns) and os.path.exists(tmp_path)
+    # 关键：真正要扫的是【去掉已完成的】那些 ASN。
+    # 重写这个函数时漏了这一步，导致加载了断点却还是从头扫（实测踩过）。
+    asns_todo = [a for a in asns if a not in done_asns]
+    if done_asns:
+        log(f"[*] 本轮要扫 {len(asns_todo)} 个 ASN"
+            f"（跳过已完成的 {len(done_asns)} 个：{', '.join(sorted(done_asns)[:5])}"
+            f"{'…' if len(done_asns) > 5 else ''}）")
+    if not asns_todo:
+        log("[*] 所有 ASN 都已扫完，直接进入收尾")
     if resuming:
         try:
             with open(tmp_path, "r", encoding="utf-8-sig") as f:
@@ -2649,8 +2658,9 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
             wr.writerow(["ip", "port", "protocol", "cfcountry", "colo"])
 
         last_asn = None
+        asn_done = len(done_asns)      # 面板显示累计进度，从已完成的数起
         for (prov, asn, prefix, n24_this, pidx, ptotal,
-             cands) in iter_prefix_batches(asns, sample, FOFA_TIMEOUT,
+             cands) in iter_prefix_batches(asns_todo, sample, FOFA_TIMEOUT,
                                            FOFA_RETRIES, DEBUG):
             # ---- 换 ASN：落一次断点，更新上面两级的进度 ----
             if asn != last_asn:

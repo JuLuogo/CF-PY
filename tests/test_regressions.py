@@ -532,6 +532,12 @@ def test_resume():
     check("有配置指纹", "def scan_fingerprint" in src)
     check("有状态读写", "def save_scan_state" in src and "def load_scan_state" in src)
     check("换 ASN 时落状态", "def flush_state" in src and "flush_state()" in src)
+    # 关键：加载了断点还得【真的跳过】已完成的 ASN。
+    # 重写 run_asn_pipeline 时漏过这一步 —— 日志说「从断点继续」，
+    # 循环却还是遍历全部 ASN，等于没续跑（实测踩过）。
+    check("续跑真的跳过已完成的 ASN",
+          "asns_todo = [a for a in asns if a not in done_asns]" in src)
+    check("循环用 asns_todo", "iter_prefix_batches(asns_todo" in src)
     check("续跑用追加模式", '"a" if resuming else "w"' in src)
     check("配置变了就重扫", "当作新一轮重新扫" in src)
     check("跑完清理状态", "clear_scan_state()" in src)
