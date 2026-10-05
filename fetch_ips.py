@@ -2605,12 +2605,25 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
             return []
         total_kept = len(kept)
 
+        # IP 级进度的节流：每 2 秒或结束时才写一次 status.json，
+        # 否则每个 IP 都写一次盘，扫描本身就被拖慢了
+        last_tick = [0.0]
+
+        def ip_tick(done, total, ip, ok, _lbl=label):
+            now = time.time()
+            if done < total and now - last_tick[0] < 2.0:
+                return
+            last_tick[0] = now
+            set_progress("ip", _lbl + " · 网段内 IP 进度", done, total,
+                         ip=ip, extra={"asn": asn, "prefix": prefix})
+
         alive = kept
         if ipt.STAGE0_ENABLED:
             conc, why = safe_concurrency(ipt.STAGE0_CONCURRENCY)
             if conc < ipt.STAGE0_CONCURRENCY:
                 log(f"[!] stage0 并发从 {ipt.STAGE0_CONCURRENCY} 压到 {conc}（{why}）")
-            alive = ipt.stage0_tcp_filter(kept, ipt.STAGE0_TIMEOUT, conc)
+            alive = ipt.stage0_tcp_filter(kept, ipt.STAGE0_TIMEOUT, conc,
+                                          on_progress=ip_tick)
             del kept
             if not alive:
                 set_progress("ip", label + " · 网段内 IP 进度", total_kept, total_kept,
@@ -2622,7 +2635,8 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
         conc1, why1 = safe_concurrency(ipt.ASYNCIO_CONCURRENCY)
         if conc1 < ipt.ASYNCIO_CONCURRENCY:
             log(f"[!] stage1 并发从 {ipt.ASYNCIO_CONCURRENCY} 压到 {conc1}（{why1}）")
-        passed = ipt.stage1_async(alive, conc1, ipt.CURL_TIMEOUT_SEC)
+        passed = ipt.stage1_async(alive, conc1, ipt.CURL_TIMEOUT_SEC,
+                                  on_progress=ip_tick)
         del alive
         set_progress("ip", label + " · 网段内 IP 进度", total_kept, total_kept,
                      extra={"asn": asn, "prefix": prefix, "found": len(passed)})

@@ -887,7 +887,8 @@ async def _tcp_probe(addr, port, sem, timeout):
                     pass
 
 
-def stage0_tcp_filter(items, timeout=STAGE0_TIMEOUT, concurrency=STAGE0_CONCURRENCY):
+def stage0_tcp_filter(items, timeout=STAGE0_TIMEOUT, concurrency=STAGE0_CONCURRENCY,
+                      on_progress=None):
     """快速 TCP 预筛：只留下端口真的开着的。"""
     import asyncio
 
@@ -913,6 +914,9 @@ def stage0_tcp_filter(items, timeout=STAGE0_TIMEOUT, concurrency=STAGE0_CONCURRE
                 if done % max(1, BATCH // 4) == 0 or done == total:
                     progress("s0", done, total,
                              f"{x['ip']} | {'open' if ok else 'blackhole'}")
+                # 回调给调用方（fetch_ips 的逐网段流水线用它更新 IP 级进度）
+                if on_progress is not None:
+                    on_progress(done, total, x["ip"], ok)
 
     asyncio.run(_run())
     log(f"[*] stage0 完成：{len(out)}/{total} 端口开着"
@@ -1026,7 +1030,7 @@ async def availability_async(ip, timeout, port, sem, req, host):
     return info if info.get("cfcountry") else None
 
 
-def stage1_async(items, concurrency, timeout):
+def stage1_async(items, concurrency, timeout, on_progress=None):
     """asyncio 版第一阶段。接口和 stage1() 一致，返回通过列表。"""
     import asyncio
 
@@ -1061,6 +1065,8 @@ def stage1_async(items, concurrency, timeout):
             for x, cf in zip(chunk, results):
                 done += 1
                 addr = x["ip"]
+                if on_progress is not None:
+                    on_progress(done, total, addr, bool(cf))
                 port = str(x.get("port") or "443")
                 tag = addr if port == "443" else f"{addr}:{port}"
                 if not cf:

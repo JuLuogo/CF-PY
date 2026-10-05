@@ -674,6 +674,12 @@ def test_four_level_progress():
     check("前端有缩进层级", "indent: i" in w)
     # 断点状态不能每个网段都写一次（1145 个网段 x 69 个 ASN = 7.9 万次写盘）
     check("断点只在换 ASN 时写", "def flush_state" in f)
+    # IP 级进度要【实时】更新，不能只在整批结束时刷一次 ——
+    # 否则用户看到的就是「0/67310 卡着不动」。
+    ip_src = open(os.path.join(ROOT, "ip.py"), encoding="utf-8").read()
+    check("stage0 支持进度回调", "on_progress=None" in ip_src)
+    check("流水线传了回调", "on_progress=ip_tick" in f)
+    check("回调有节流（不然每 IP 写一次盘）", "last_tick" in f)
 
 
 if __name__ == "__main__":
