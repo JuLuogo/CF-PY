@@ -1029,11 +1029,27 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj, ensure_ascii=False))
 
+    def _token_from(self, qs):
+        """从三个地方找 token，按优先级：
+           1) URL 查询参数 ?token=xxx
+           2) HTTP 头 Authorization: Bearer xxx
+           3) HTTP 头 X-Token: xxx
+        给下游服务用 header 更规范，不用每次拼 URL。
+        """
+        t = (qs.get("token") or [""])[0].strip()
+        if t:
+            return t
+        auth = (self.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        if auth:
+            return auth
+        return (self.headers.get("X-Token") or "").strip()
+
     def _authed(self, qs):
         if not TOKEN:
             return True
-        got = (qs.get("token") or [""])[0]
-        return got == TOKEN
+        return self._token_from(qs) == TOKEN
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -1043,7 +1059,19 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/healthz":
             return self._json({"ok": True})
         if not self._authed(qs):
-            return self._json({"error": "token 不正确"}, 401)
+            return self._json({
+                "error": "token 不正确（或没带）",
+                "怎么传": [
+                    "URL 参数：  /api/ips?token=你的口令",
+                    "HTTP 头：   Authorization: Bearer 你的口令",
+                    "HTTP 头：   X-Token: 你的口令",
+                ],
+                "口令在哪": "安装时打印的，或 /etc/systemd/system/cfip-web.service 里的 -token",
+                "完整示例": "curl 'http://127.0.0.1:端口/api/ips?token=你的口令'",
+            }, 401)
+        # 路径统一转小写再比对 —— 用户实测访问过 /API/IPS，
+        # 大小写敏感的话会 404，很容易踩
+        u = u._replace(path=(u.path or "").rstrip("/").lower() or "/")
         if u.path == "/api/status":
             return self._json(load_status())
         if u.path == "/api/results":
@@ -1085,6 +1113,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        u = u._replace(path=(u.path or "").rstrip("/").lower() or "/")
         qs = parse_qs(u.query)
         if not self._authed(qs):
             return self._json({"error": "token 不正确"}, 401)

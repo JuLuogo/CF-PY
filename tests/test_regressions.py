@@ -240,6 +240,16 @@ def test_webui():
 
     os.remove(sf)
 
+    # API 易用性：token 支持三种传法 + 路径不区分大小写
+    # （用户实测访问过 /API/IPS，大小写敏感会 404；而且必须带 ?token= 很别扭）
+    wsrc = open(os.path.join(ROOT, "webui.py"), encoding="utf-8").read()
+    check("token 支持 URL 参数", 'qs.get("token")' in wsrc)
+    check("token 支持 Authorization 头", "Bearer " in wsrc)
+    check("token 支持 X-Token 头", "X-Token" in wsrc)
+    check("路径不区分大小写", 'rstrip("/").lower()' in wsrc)
+    check("鉴权失败有引导", "怎么传" in wsrc)
+    check("没有引用不存在的 PORT", "{PORT}" not in wsrc)
+
     # 推送设置：存 -> 读 往返
     orig = open(webui.CONFIG_PATH, encoding="utf-8").read()
     try:
