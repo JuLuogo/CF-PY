@@ -431,7 +431,7 @@ def test_progress_keys():
 
     # 现在面板按四级（provider/asn/prefix/ip）渲染，
     # 后端上报的 key 必须落在这四级里
-    four = {"provider", "asn", "prefix", "ip", "s0", "s1", "geo", "s2", "s3"}
+    four = {"provider", "asn", "prefix", "ip0", "ip1", "ip", "s0", "s1", "geo", "s2", "s3"}
     missing = sorted(reported - four)
     check("后端上报的进度 key 都在面板能渲染的范围内", not missing,
           f"后端上报但前端不渲染: {missing}")
@@ -675,7 +675,7 @@ def test_four_level_progress():
     check("后端上报 provider 级", 'set_progress("provider"' in f)
     check("后端上报 asn 级", 'set_progress("asn"' in f)
     check("后端上报 prefix 级", 'set_progress("prefix"' in f)
-    check("后端上报 ip 级", 'set_progress("ip"' in f)
+    check("后端上报 ip 级", 'set_progress("ip0"' in f and 'set_progress("ip1"' in f)
     check("有 ASN->厂商 反查", "def provider_of" in f)
     check("逐网段生成器", "def iter_prefix_batches" in f)
     check("小网段合并", "PREFIX_MIN_BATCH" in f)
@@ -689,8 +689,8 @@ def test_four_level_progress():
     # 否则用户看到的就是「0/67310 卡着不动」。
     ip_src = open(os.path.join(ROOT, "ip.py"), encoding="utf-8").read()
     check("stage0 支持进度回调", "on_progress=None" in ip_src)
-    check("流水线传了回调", "on_progress=ip_tick" in f)
-    check("回调有节流（不然每 IP 写一次盘）", "last_tick" in f)
+    check("流水线传了回调", "on_progress=tick0" in f and "on_progress=tick1" in f)
+    check("回调有节流（不然每 IP 写一次盘）", "last_tick0" in f and "last_tick1" in f)
 
 
 if __name__ == "__main__":
