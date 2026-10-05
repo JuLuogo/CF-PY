@@ -249,6 +249,15 @@ def test_webui():
     check("路径不区分大小写", 'rstrip("/").lower()' in wsrc)
     check("鉴权失败有引导", "怎么传" in wsrc)
     check("没有引用不存在的 PORT", "{PORT}" not in wsrc)
+    # 上游模式只跑 stage1，country（IP 归属地，stage2 的 geo 查询填的）
+    # 永远是空的 —— 必须用 cfcountry（CF 边缘节点所在国）兜底，
+    # 否则地区统计全是「??」、地区 API 永远返回空。
+    fsrc = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    check("地区统计用 cfcountry 兜底",
+          'row.get("country") or row.get("cfcountry")' in fsrc)
+    check("地区筛选用 cfcountry 兜底",
+          'r.get("country") or r.get("cfcountry")' in wsrc)
+    check("update_pool 也兜底", 'or r.get("cfcountry")' in fsrc)
 
     # 推送设置：存 -> 读 往返
     orig = open(webui.CONFIG_PATH, encoding="utf-8").read()

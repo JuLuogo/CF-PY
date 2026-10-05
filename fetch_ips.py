@@ -1874,7 +1874,10 @@ def update_pool(rows, complete=True):
             "first_seen": first, "last_seen": now, "seen_count": str(seen),
             "cfcountry": str(r.get("cfcountry") or (prev or {}).get("cfcountry") or ""),
             "colo": str(r.get("colo") or (prev or {}).get("colo") or ""),
-            "country": str(r.get("country") or (prev or {}).get("country") or ""),
+            # country 空时用 cfcountry 兜底 —— 上游模式没有 geo 查询，
+            # 不给兜底的话地区筛选和统计都用不了
+            "country": str(r.get("country") or (prev or {}).get("country")
+                           or r.get("cfcountry") or (prev or {}).get("cfcountry") or ""),
             "city": str(r.get("city") or (prev or {}).get("city") or ""),
             "latency": str(r.get("latency") or ""),
             "loss": str(r.get("loss") or ""),
@@ -1939,7 +1942,10 @@ def pool_summary():
     now = datetime.now()
     dist, fresh = {}, {"今天": 0, "3天内": 0, "7天内": 0, "更早": 0}
     for row in pool.values():
-        cc = (row.get("country") or "??").upper()
+        # 上游模式只跑 stage1，country（IP 自己的归属地，stage2 的 geo 查询填的）
+        # 永远是空的 —— 这时要用 cfcountry（CF 边缘节点所在国，
+        # 也就是流量从哪出去），否则地区统计全是「??」、地区 API 永远为空。
+        cc = (row.get("country") or row.get("cfcountry") or "??").upper()
         dist[cc] = dist.get(cc, 0) + 1
         try:
             age = (now - datetime.strptime(row.get("last_seen") or "",
@@ -2088,7 +2094,8 @@ def read_pool_rows(limit=500, region=None, max_age_days=None):
         cutoff = datetime.now() - timedelta(days=max_age_days)
     rows = []
     for row in pool.values():
-        cc = (row.get("country") or "").upper()
+        # 同 pool_summary：country 空时退回 cfcountry
+        cc = (row.get("country") or row.get("cfcountry") or "").upper()
         if region and cc not in region:
             continue
         if cutoff is not None:

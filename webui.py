@@ -302,7 +302,8 @@ def serve_ips(qs):
     out = []
     for r in rows:
         lat, loss, spd = _num(r.get("latency")), _num(r.get("loss")), _num(r.get("speed"))
-        cc = (r.get("country") or "").upper()
+        # country 空时退回 cfcountry（上游模式没有 geo 查询）
+        cc = (r.get("country") or r.get("cfcountry") or "").upper()
         if max_lat is not None and (lat is None or lat > max_lat):
             continue
         if max_loss is not None and (loss is None or loss > max_loss):
@@ -893,7 +894,8 @@ async function refresh(){
       const all = await api('/api/pool');
       const rows = all.rows || [];
       renderTable('resAll', 'resCountAll', rows, '池子还是空的（等一轮扫完）');
-      const regRows = rows.filter(r => REGIONS.includes(String(r.country || '').toUpperCase()));
+      const regRows = rows.filter(r =>
+        REGIONS.includes(String(r.country || r.cfcountry || '').toUpperCase()));
       renderTable('resRegion', 'resCountRegion', regRows,
         '池子里暂时没有 ' + REGIONS.join('/') + ' 的 IP');
       document.getElementById('iptxt').textContent = rows.length
