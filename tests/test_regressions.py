@@ -434,9 +434,16 @@ def test_progress_keys():
           f"后端上报但前端不渲染: {missing}")
     check("stage0 在前端顺序里", "s0" in order, f"STAGE_ORDER={sorted(order)}")
 
-    # 没开始的阶段也要渲染出来（否则只看到一条）
-    check("未开始的阶段会渲染占位", "未开始" in w)
-    check("当前任务有高亮", "当前任务" in w)
+    # 流水线是逐 ASN 嵌套的，面板必须分两级显示 ——
+    # 否则用户只能看到第一条在动，后面全「未开始」，不知道具体在哪一步。
+    check("面板有总体进度块", "总体进度" in w)
+    check("面板有当前 ASN 子步骤块", "当前 ASN（" in w)
+    check("显示累计已测/已找到", "cum_scanned" in w and "cum_found" in w)
+    check("跳过的阶段单独一块", "上游不跑的阶段" in w)
+    check("有等待状态", "waiting" in w)
+    # 后端要在换 ASN 时清掉上一轮子步骤 + 带 ASN 上下文
+    check("换 ASN 时清子步骤", 'clear_progress("s0", "s1")' in f)
+    check("进度带 ASN 上下文", "cur_asn" in f)
 
 
 
@@ -538,7 +545,9 @@ def test_skipped_stages():
     w = open(os.path.join(ROOT, "webui.py"), encoding="utf-8").read()
     check("后端会标记 skipped", '"skipped": True' in f)
     check("面板渲染「已跳过」", "已跳过" in w)
-    check("当前任务不选已跳过的阶段", "!p.skipped" in w)
+    # 跳过阶段现在单独成块渲染，不参与「当前任务」的挑选
+    check("跳过阶段单独成块", "skipped" in w and "已跳过" in w)
+    check("当前任务只取未跳过的", "const overall = prog['asn']" in w)
 
 
 

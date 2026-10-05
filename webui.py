@@ -711,7 +711,7 @@ function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;'
 
 // 整条流水线的顺序。全部都会渲染出来（没开始的显示 0%），
 // 这样一眼能看到「现在在哪一步、后面还有几步」。
-const STAGE_ORDER = ['asn', 'geo', 's0', 's1', 's2', 's3'];
+const STAGE_ORDER = ['asn', 'geo', 's0', 's1', 's2', 's3'];   // 供回归测试校验
 const STAGE_SHORT = {
   asn: '抓取 · 查询 ASN 宣告网段', geo: '抓取 · 地区标注',
   s0: 'stage0 · TCP 预筛',
@@ -744,83 +744,109 @@ function progBarHtml(k, p){
     + '</div>';
 }
 
+function bar(p, opts){
+  opts = opts || {};
+  const pct = (p.pct != null) ? p.pct : 0;
+  const done = (p.done != null) ? p.done : 0;
+  const total = p.total || 0;
+  const isCur = !!opts.current;
+  let cur = '';
+  if (p.waiting) {
+    cur = '<span class="k">等待中…</span>';
+  } else if (p.ip) {
+    cur = '正在测 <b>' + esc(p.ip) + '</b>';
+    if (p.cidr) cur += '　网段 <b>' + esc(p.cidr) + '</b>';
+    if (p.port && p.port !== '443') cur += '　端口 <b>' + esc(p.port) + '</b>';
+  } else if (p.current) {
+    cur = '正在处理 <b>' + esc(p.current) + '</b>';
+  }
+  const num = (opts.noTotal || !total)
+    ? (done ? done.toLocaleString() + ' 个' : '')
+    : done.toLocaleString() + ' / ' + total.toLocaleString() + '　' + pct.toFixed(1) + '%';
+  return '<div style="margin-bottom:11px' + (isCur ? '' : ';opacity:.7') + '">'
+    + '<div class="row" style="margin:0 0 4px;justify-content:space-between">'
+    +   '<span>' + (isCur ? '<b>' : '') + esc(p.name || '') + (isCur ? '</b>' : '')
+    +     (pct >= 100 && !opts.noTotal ? ' <span class="pill on">完成</span>' : '')
+    +     (p.waiting ? ' <span class="pill idle">等待</span>' : '') + '</span>'
+    +   '<span class="k" style="margin:0">' + num + '</span>'
+    + '</div>'
+    + '<div class="bar"><i style="width:' + (opts.noTotal ? 0 : pct) + '%"></i></div>'
+    + (cur ? '<div class="hint" style="margin-top:5px">' + cur + '</div>' : '')
+    + '</div>';
+}
+
 function renderProgress(st){
   const prog = st.progress || {};
   const wrap = document.getElementById('progwrap');
-  // 当前任务 = 第一个还没跑完的阶段
-  let curTask = null;
-  for (const k of STAGE_ORDER) {
-    const p = prog[k];
-    if (p && !p.skipped && (p.pct == null || p.pct < 100)) { curTask = k; break; }
-  }
-  if (!curTask) {
-    // 都跑完了，或者都还没开始 -> 取最后一个有数据的
-    for (let i = STAGE_ORDER.length - 1; i >= 0; i--) {
-      if (prog[STAGE_ORDER[i]]) { curTask = STAGE_ORDER[i]; break; }
-    }
-  }
-  if (!curTask) curTask = 'asn';
 
-  // 顶部：当前任务
-  const cp = prog[curTask] || {};
-  let head = '<div class="row" style="margin:0 0 14px">'
-    + '<span class="pill on">当前任务</span>'
-    + '<b style="font-size:15px">' + esc(cp.name || STAGE_SHORT[curTask] || curTask) + '</b>'
-    + '<span class="k" style="margin:0">第 ' + (st.round || 0) + ' 轮</span>';
-  if (cp.ip) head += '<span class="k" style="margin:0">' + esc(cp.ip)
-    + (cp.cidr ? '（' + esc(cp.cidr) + '）' : '') + '</span>';
-  else if (cp.current) head += '<span class="k" style="margin:0">' + esc(cp.current) + '</span>';
+  // 流水线是【逐 ASN 嵌套】的：每个 ASN 都要走一遍 查网段->stage0->stage1。
+  // 所以面板分两块显示：
+  //   总体：厂商 ASN 走到第几个 + 累计数字
+  //   当前 ASN：它的子步骤（stage0/stage1）走到哪
+  const overall = prog['asn'];
+  const perAsn = ['s0', 's1'].map(k => prog[k]).filter(Boolean);
+  const skipped = ['geo', 's2', 's3'].map(k => prog[k]).filter(p => p && p.skipped);
+  const curAsn = (overall && overall.cur_asn) || '';
+
+  if (!overall && !perAsn.length) {
+    wrap.innerHTML = '<div class="hint">还没有进度信息（等扫描跑起来）</div>';
+    return;
+  }
+
+  // ---- 顶部：当前任务 ----
+  let head = '<div class="row" style="margin:0 0 16px;flex-wrap:wrap">'
+    + '<span class="pill on">当前任务</span>';
+  if (curAsn) {
+    head += '<b style="font-size:15px">正在处理 ' + esc(curAsn) + '</b>';
+    if (overall) head += '<span class="k" style="margin:0">第 '
+      + (overall.done || 0) + ' / ' + (overall.total || 0) + ' 个 ASN</span>';
+  } else if (overall) {
+    head += '<b style="font-size:15px">' + esc(overall.name || '') + '</b>';
+  }
+  head += '<span class="k" style="margin:0">第 ' + (st.round || 0) + ' 轮</span>';
   head += '</div>';
 
-  // 下面：整条流水线，每步一条。没开始的显示 0%（灰）。
-  const bars = STAGE_ORDER.map(function(k){
-    const p = prog[k];
-    const isCur = (k === curTask);
-    if (!p) {
-      return '<div style="margin-bottom:12px;opacity:.45">'
-        + '<div class="row" style="margin:0 0 4px;justify-content:space-between">'
-        +   '<span>' + esc(STAGE_SHORT[k] || k) + ' <span class="k">未开始</span></span>'
-        +   '<span class="k" style="margin:0">—</span>'
-        + '</div>'
-        + '<div class="bar"><i style="width:0"></i></div>'
+  // ---- 第一块：总体进度 ----
+  let html = '<div style="margin-bottom:18px">'
+    + '<div style="font-weight:600;margin-bottom:9px;color:#cfd6e6">总体进度</div>';
+  if (overall) {
+    html += bar(overall, {current: true});
+    const cs = overall.cum_scanned, cf = overall.cum_found;
+    if (cs != null || cf != null) {
+      html += '<div class="hint" style="margin-top:-4px">'
+        + (cs != null ? '累计已测 <b>' + Number(cs).toLocaleString() + '</b> 个 IP' : '')
+        + (cs != null && cf != null ? '　·　' : '')
+        + (cf != null ? '累计找到 <b>' + Number(cf).toLocaleString() + '</b> 个反代' : '')
         + '</div>';
     }
-    // 上游模式下 stage2/stage3 压根不会跑，标成「已跳过」而不是「未开始」
-    if (p.skipped) {
-      return '<div style="margin-bottom:12px;opacity:.5">'
-        + '<div class="row" style="margin:0 0 4px;justify-content:space-between">'
-        +   '<span>' + esc(p.name || STAGE_SHORT[k] || k)
-        +     ' <span class="pill idle">已跳过</span></span>'
-        +   '<span class="k" style="margin:0">—</span>'
-        + '</div>'
-        + '<div class="bar"><i style="width:0"></i></div>'
-        + '</div>';
-    }
-    const pct = (p.pct != null) ? p.pct : 0;
-    const done = (p.done != null) ? p.done : 0;
-    const total = p.total || 0;
-    let cur = '';
-    if (p.ip) {
-      cur = '正在测 <b>' + esc(p.ip) + '</b>';
-      if (p.cidr) cur += '　网段 <b>' + esc(p.cidr) + '</b>';
-      if (p.port && p.port !== '443') cur += '　端口 <b>' + esc(p.port) + '</b>';
-    } else if (p.current) {
-      cur = '正在处理 <b>' + esc(p.current) + '</b>';
-    }
-    return '<div style="margin-bottom:12px' + (isCur ? '' : ';opacity:.75') + '">'
-      + '<div class="row" style="margin:0 0 4px;justify-content:space-between">'
-      +   '<span>' + (isCur ? '<b>' : '') + esc(p.name || STAGE_SHORT[k] || k)
-      +     (isCur ? '</b>' : '')
-      +     (pct >= 100 ? ' <span class="pill on">完成</span>' : '') + '</span>'
-      +   '<span class="k" style="margin:0">' + done.toLocaleString()
-      +     ' / ' + total.toLocaleString() + '　' + pct.toFixed(1) + '%</span>'
-      + '</div>'
-      + '<div class="bar"><i style="width:' + pct + '%"></i></div>'
-      + (cur ? '<div class="hint" style="margin-top:5px">' + cur + '</div>' : '')
-      + '</div>';
-  }).join('');
+  } else {
+    html += '<div class="hint">（还没开始）</div>';
+  }
+  html += '</div>';
 
-  wrap.innerHTML = head + bars;
+  // ---- 第二块：当前 ASN 的子步骤 ----
+  html += '<div style="margin-bottom:18px">'
+    + '<div style="font-weight:600;margin-bottom:9px;color:#cfd6e6">'
+    + (curAsn ? '当前 ASN（' + esc(curAsn) + '）的步骤' : '当前 ASN 的步骤')
+    + ' <span class="k" style="font-weight:400">每个 ASN 都会重新走一遍</span></div>';
+  if (perAsn.length) {
+    html += perAsn.map((p, i) => bar(p, {current: i === perAsn.length - 1})).join('');
+  } else {
+    html += '<div class="hint">（还没进入 ASN 处理）</div>';
+  }
+  html += '</div>';
+
+  // ---- 第三块：跳过的阶段 ----
+  if (skipped.length) {
+    html += '<div style="opacity:.5">'
+      + '<div style="font-weight:600;margin-bottom:8px;color:#cfd6e6">上游不跑的阶段</div>'
+      + skipped.map(p => '<div class="row" style="margin:0 0 6px">'
+          + '<span class="k" style="margin:0">' + esc(p.name || '') + '</span>'
+          + '<span class="pill idle">已跳过</span></div>').join('')
+      + '</div>';
+  }
+
+  wrap.innerHTML = head + html;
 }
 
 function renderTable(tbodyId, countId, rows, emptyMsg){

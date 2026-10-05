@@ -2352,6 +2352,7 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
     tmp_path = stage1_path + ".new"
     seen_keys = set()
     asn_done = 0
+    cum_scanned = 0        # 累计已测 IP 数（过了 stage0 的）
     total_asns = len(asns)
     started = time.time()
 
@@ -2421,6 +2422,16 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
             if not cands:
                 continue
 
+            # 流水线是【逐 ASN 嵌套】的：每个 ASN 都要走一遍
+            # 查网段 -> 生成候选 -> stage0 -> stage1。
+            # 所以 stage0/stage1 的进度是【每个 ASN 重置一次】的，
+            # 面板要按「当前 ASN 的子步骤」展示，不能当成全局顺序的 6 步。
+            clear_progress("s0", "s1")
+            set_progress("s0", asn + " · stage0 预筛（TCP 连通性）", 0, 0,
+                         extra={"waiting": True, "asn": asn})
+            set_progress("s1", asn + " · stage1 可用性检查", 0, 0,
+                         extra={"waiting": True, "asn": asn})
+
             # 归一化 / 排除私网 / 端口过滤（分批，避免一次性建大列表）
             kept = []
             for i in range(0, len(cands), 20000):
@@ -2444,6 +2455,7 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
                 del kept
                 if not alive:
                     continue
+                cum_scanned += len(alive)
 
             # stage1：可用性（确认是不是真反代）
             conc1, why1 = safe_concurrency(ipt.ASYNCIO_CONCURRENCY)
@@ -2451,6 +2463,10 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
                 log(f"[!] stage1 并发从 {ipt.ASYNCIO_CONCURRENCY} 压到 {conc1}（{why1}）")
             passed = ipt.stage1_async(alive, conc1, ipt.CURL_TIMEOUT_SEC)
             del alive
+            set_progress("asn", "厂商 ASN（总进度）", asn_done, total_asns,
+                         current=asn, extra={"cum_scanned": cum_scanned,
+                                             "cum_found": found + len(passed),
+                                             "cur_asn": asn})
 
             # 只把通过的写盘
             for r in passed:
