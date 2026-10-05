@@ -429,21 +429,22 @@ def test_progress_keys():
     if 'progress("s0"' in i:
         reported.add("s0")
 
-    missing = sorted(reported - order)
-    check("前端 STAGE_ORDER 覆盖了后端所有进度 key", not missing,
+    # 现在面板按四级（provider/asn/prefix/ip）渲染，
+    # 后端上报的 key 必须落在这四级里
+    four = {"provider", "asn", "prefix", "ip", "s0", "s1", "geo", "s2", "s3"}
+    missing = sorted(reported - four)
+    check("后端上报的进度 key 都在面板能渲染的范围内", not missing,
           f"后端上报但前端不渲染: {missing}")
-    check("stage0 在前端顺序里", "s0" in order, f"STAGE_ORDER={sorted(order)}")
+    check("前端按四级渲染", "'provider', 'asn', 'prefix', 'ip'" in w)
 
     # 流水线是逐 ASN 嵌套的，面板必须分两级显示 ——
     # 否则用户只能看到第一条在动，后面全「未开始」，不知道具体在哪一步。
-    check("面板有总体进度块", "总体进度" in w)
-    check("面板有当前 ASN 子步骤块", "当前 ASN（" in w)
+    check("面板有面包屑（厂商>ASN>网段）", "chain.push" in w)
     check("显示累计已测/已找到", "cum_scanned" in w and "cum_found" in w)
     check("跳过的阶段单独一块", "上游不跑的阶段" in w)
     check("有等待状态", "waiting" in w)
-    # 后端要在换 ASN 时清掉上一轮子步骤 + 带 ASN 上下文
-    check("换 ASN 时清子步骤", 'clear_progress("s0", "s1")' in f)
     check("进度带 ASN 上下文", "cur_asn" in f)
+    check("进度带网段上下文", '"prefix"' in f)
 
 
 
@@ -530,8 +531,8 @@ def test_resume():
     src = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
     check("有配置指纹", "def scan_fingerprint" in src)
     check("有状态读写", "def save_scan_state" in src and "def load_scan_state" in src)
-    check("每扫完一个 ASN 落状态", "done_asns.add(asn)" in src)
-    check("续跑用追加模式", 'mode = "a" if resuming else "w"' in src)
+    check("换 ASN 时落状态", "def flush_state" in src and "flush_state()" in src)
+    check("续跑用追加模式", '"a" if resuming else "w"' in src)
     check("配置变了就重扫", "当作新一轮重新扫" in src)
     check("跑完清理状态", "clear_scan_state()" in src)
 
@@ -545,9 +546,9 @@ def test_skipped_stages():
     w = open(os.path.join(ROOT, "webui.py"), encoding="utf-8").read()
     check("后端会标记 skipped", '"skipped": True' in f)
     check("面板渲染「已跳过」", "已跳过" in w)
-    # 跳过阶段现在单独成块渲染，不参与「当前任务」的挑选
+    check("跳过的阶段不占层级", "skipped = ['geo', 's2', 's3']" in w)
     check("跳过阶段单独成块", "skipped" in w and "已跳过" in w)
-    check("当前任务只取未跳过的", "const overall = prog['asn']" in w)
+    check("四级层级列表存在", "const LV = [" in w)
 
 
 
@@ -605,6 +606,76 @@ def test_resource_guard():
         check("调优脚本限制 journal 大小", "SystemMaxUse" in tc)
 
 
+
+
+# ---------------------------------------------------------------- 19. 关键函数不能丢
+def test_critical_functions_exist():
+    """用大段替换改代码时，很容易把夹在中间的函数一起删掉。
+    实测踩过两次：替换 run_asn_pipeline 时误删了 provider_of、
+    count_24s、sample_24s —— 语法检查能过（都是合法 Python），
+    但一运行就 NameError。
+
+    这里把「必须存在的关键函数」列出来，少一个就报错。
+    """
+    import re
+    src = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    have = set(re.findall(r"^(?:async )?def (\w+)\(", src, re.M))
+    need = [
+        # 采样
+        "count_24s", "sample_24s", "provider_of",
+        # 生成器
+        "iter_prefix_batches", "iter_asn_batches", "iter_asn_candidates",
+        # 流水线
+        "run_asn_pipeline", "run_once",
+        # 池子
+        "load_pool", "update_pool", "_write_pool", "read_pool_rows", "pool_summary",
+        # 续跑
+        "scan_fingerprint", "load_scan_state", "save_scan_state", "clear_scan_state",
+        # 资源保护
+        "mem_available_mb", "safe_concurrency", "sys_guard", "_read_sysctl_int",
+        # 进度
+        "set_progress", "clear_progress", "read_status", "cidr24",
+        # 状态
+        "write_status", "read_final_summary", "read_stage1_results",
+        # 清理
+        "cleanup_outputs", "disk_guard",
+    ]
+    missing = [f for f in need if f not in have]
+    check("fetch_ips.py 关键函数齐全", not missing, f"缺失: {missing}")
+
+    ip_src = open(os.path.join(ROOT, "ip.py"), encoding="utf-8").read()
+    ip_have = set(re.findall(r"^(?:async )?def (\w+)\(", ip_src, re.M))
+    ip_need = ["availability", "availability_http", "availability_native",
+               "availability_async", "port_uses_http", "_http_get_plain",
+               "_http_get_via", "_tune_sock", "_tune_asyncio_sock", "_start_tls",
+               "stage0_tcp_filter", "stage1_async", "stage1_streaming",
+               "submit_batched", "iter_ips_chunked", "count_ips", "load_ips",
+               "outputs", "_write_txt", "_write_csv", "_fmt_line"]
+    ip_missing = [f for f in ip_need if f not in ip_have]
+    check("ip.py 关键函数齐全", not ip_missing, f"缺失: {ip_missing}")
+
+
+# ---------------------------------------------------------------- 20. 四级进度
+def test_four_level_progress():
+    """用户要的是「层层展开」：厂商 -> ASN -> 网段 -> IP。"""
+    f = open(os.path.join(ROOT, "fetch_ips.py"), encoding="utf-8").read()
+    w = open(os.path.join(ROOT, "webui.py"), encoding="utf-8").read()
+
+    check("后端上报 provider 级", 'set_progress("provider"' in f)
+    check("后端上报 asn 级", 'set_progress("asn"' in f)
+    check("后端上报 prefix 级", 'set_progress("prefix"' in f)
+    check("后端上报 ip 级", 'set_progress("ip"' in f)
+    check("有 ASN->厂商 反查", "def provider_of" in f)
+    check("逐网段生成器", "def iter_prefix_batches" in f)
+    check("小网段合并", "PREFIX_MIN_BATCH" in f)
+
+    check("前端按四级渲染", "'provider', 'asn', 'prefix', 'ip'" in w)
+    check("前端有面包屑", "chain.push" in w)
+    check("前端有缩进层级", "indent: i" in w)
+    # 断点状态不能每个网段都写一次（1145 个网段 x 69 个 ASN = 7.9 万次写盘）
+    check("断点只在换 ASN 时写", "def flush_state" in f)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  回归测试")
@@ -615,7 +686,8 @@ if __name__ == "__main__":
                test_once_semantics, test_two_datasets, test_progress_keys,
                test_no_bulk_candidate_file, test_pool_safety,
                test_port_protocols, test_resume, test_skipped_stages,
-               test_resource_guard):
+               test_resource_guard, test_critical_functions_exist,
+               test_four_level_progress):
         print(f"\n[{fn.__name__}] {fn.__doc__.splitlines()[0] if fn.__doc__ else ''}")
         try:
             fn()

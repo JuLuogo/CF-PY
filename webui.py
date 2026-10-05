@@ -749,29 +749,33 @@ function bar(p, opts){
   const pct = (p.pct != null) ? p.pct : 0;
   const done = (p.done != null) ? p.done : 0;
   const total = p.total || 0;
-  const isCur = !!opts.current;
+  const indent = opts.indent || 0;
   let cur = '';
   if (p.waiting) {
     cur = '<span class="k">等待中…</span>';
+  } else if (p.note) {
+    cur = '<span class="k">' + esc(p.note) + '</span>';
   } else if (p.ip) {
     cur = '正在测 <b>' + esc(p.ip) + '</b>';
     if (p.cidr) cur += '　网段 <b>' + esc(p.cidr) + '</b>';
-    if (p.port && p.port !== '443') cur += '　端口 <b>' + esc(p.port) + '</b>';
   } else if (p.current) {
-    cur = '正在处理 <b>' + esc(p.current) + '</b>';
+    cur = '当前 <b>' + esc(p.current) + '</b>';
   }
-  const num = (opts.noTotal || !total)
-    ? (done ? done.toLocaleString() + ' 个' : '')
-    : done.toLocaleString() + ' / ' + total.toLocaleString() + '　' + pct.toFixed(1) + '%';
-  return '<div style="margin-bottom:11px' + (isCur ? '' : ';opacity:.7') + '">'
+  if (p.found != null && p.found > 0) cur += '　本网段找到 <b>' + p.found + '</b> 个';
+  const num = total
+    ? done.toLocaleString() + ' / ' + total.toLocaleString() + '　' + pct.toFixed(1) + '%'
+    : (done ? done.toLocaleString() + ' 个' : '—');
+  return '<div style="margin:0 0 10px;padding-left:' + (indent * 22) + 'px'
+      + (indent ? ';border-left:2px solid #2b3040;margin-left:4px' : '') + '">'
     + '<div class="row" style="margin:0 0 4px;justify-content:space-between">'
-    +   '<span>' + (isCur ? '<b>' : '') + esc(p.name || '') + (isCur ? '</b>' : '')
-    +     (pct >= 100 && !opts.noTotal ? ' <span class="pill on">完成</span>' : '')
+    +   '<span style="font-size:' + (indent <= 1 ? 14 : 13) + 'px">'
+    +     (opts.current ? '<b>' : '') + esc(p.name || '') + (opts.current ? '</b>' : '')
+    +     (pct >= 100 && total ? ' <span class="pill on">完成</span>' : '')
     +     (p.waiting ? ' <span class="pill idle">等待</span>' : '') + '</span>'
     +   '<span class="k" style="margin:0">' + num + '</span>'
     + '</div>'
-    + '<div class="bar"><i style="width:' + (opts.noTotal ? 0 : pct) + '%"></i></div>'
-    + (cur ? '<div class="hint" style="margin-top:5px">' + cur + '</div>' : '')
+    + '<div class="bar"><i style="width:' + pct + '%"></i></div>'
+    + (cur ? '<div class="hint" style="margin-top:4px">' + cur + '</div>' : '')
     + '</div>';
 }
 
@@ -779,68 +783,56 @@ function renderProgress(st){
   const prog = st.progress || {};
   const wrap = document.getElementById('progwrap');
 
-  // 流水线是【逐 ASN 嵌套】的：每个 ASN 都要走一遍 查网段->stage0->stage1。
-  // 所以面板分两块显示：
-  //   总体：厂商 ASN 走到第几个 + 累计数字
-  //   当前 ASN：它的子步骤（stage0/stage1）走到哪
-  const overall = prog['asn'];
-  const perAsn = ['s0', 's1'].map(k => prog[k]).filter(Boolean);
+  // 用户要的是「层层展开」：厂商 -> ASN -> 网段 -> IP。
+  // 流水线按【网段】处理，所以每一级都有真实进度。
+  // 主层级：厂商 -> ASN -> 网段 -> IP（ASN 数据源走这条）
+  // 兜底：s0/s1 是 ip.py 子进程路径（fofa 数据源）上报的，
+  // 有就一并渲染，没有就跳过。
+  const LV = ['provider', 'asn', 'prefix', 'ip', 's0', 's1'];
+  const have = LV.filter(k => prog[k]);
   const skipped = ['geo', 's2', 's3'].map(k => prog[k]).filter(p => p && p.skipped);
-  const curAsn = (overall && overall.cur_asn) || '';
 
-  if (!overall && !perAsn.length) {
+  if (!have.length) {
     wrap.innerHTML = '<div class="hint">还没有进度信息（等扫描跑起来）</div>';
     return;
   }
 
-  // ---- 顶部：当前任务 ----
+  const p0 = prog['provider'] || prog['asn'] || {};
+  const curProv = p0.provider || '';
+  const curAsn = (prog['asn'] || {}).cur_asn || '';
+  const curPrefix = (prog['prefix'] || {}).prefix || '';
+
+  // 顶部：当前任务，一路显示到最细的层级
   let head = '<div class="row" style="margin:0 0 16px;flex-wrap:wrap">'
     + '<span class="pill on">当前任务</span>';
-  if (curAsn) {
-    head += '<b style="font-size:15px">正在处理 ' + esc(curAsn) + '</b>';
-    if (overall) head += '<span class="k" style="margin:0">第 '
-      + (overall.done || 0) + ' / ' + (overall.total || 0) + ' 个 ASN</span>';
-  } else if (overall) {
-    head += '<b style="font-size:15px">' + esc(overall.name || '') + '</b>';
-  }
+  let chain = [];
+  if (curProv) chain.push(esc(curProv));
+  if (curAsn) chain.push('<b>' + esc(curAsn) + '</b>');
+  if (curPrefix) chain.push('<b>' + esc(curPrefix) + '</b>');
+  head += '<b style="font-size:15px">' + (chain.length ? chain.join(' › ') : '准备中') + '</b>';
   head += '<span class="k" style="margin:0">第 ' + (st.round || 0) + ' 轮</span>';
   head += '</div>';
 
-  // ---- 第一块：总体进度 ----
-  let html = '<div style="margin-bottom:18px">'
-    + '<div style="font-weight:600;margin-bottom:9px;color:#cfd6e6">总体进度</div>';
-  if (overall) {
-    html += bar(overall, {current: true});
-    const cs = overall.cum_scanned, cf = overall.cum_found;
-    if (cs != null || cf != null) {
-      html += '<div class="hint" style="margin-top:-4px">'
-        + (cs != null ? '累计已测 <b>' + Number(cs).toLocaleString() + '</b> 个 IP' : '')
-        + (cs != null && cf != null ? '　·　' : '')
-        + (cf != null ? '累计找到 <b>' + Number(cf).toLocaleString() + '</b> 个反代' : '')
-        + '</div>';
-    }
-  } else {
-    html += '<div class="hint">（还没开始）</div>';
-  }
-  html += '</div>';
+  // 逐层渲染，缩进体现层级
+  let html = have.map((k, i) => bar(prog[k], {
+    indent: i,
+    current: i === have.length - 1
+  })).join('');
 
-  // ---- 第二块：当前 ASN 的子步骤 ----
-  html += '<div style="margin-bottom:18px">'
-    + '<div style="font-weight:600;margin-bottom:9px;color:#cfd6e6">'
-    + (curAsn ? '当前 ASN（' + esc(curAsn) + '）的步骤' : '当前 ASN 的步骤')
-    + ' <span class="k" style="font-weight:400">每个 ASN 都会重新走一遍</span></div>';
-  if (perAsn.length) {
-    html += perAsn.map((p, i) => bar(p, {current: i === perAsn.length - 1})).join('');
-  } else {
-    html += '<div class="hint">（还没进入 ASN 处理）</div>';
+  // 累计数字
+  const asnP = prog['asn'] || {};
+  if (asnP.cum_scanned != null || asnP.cum_found != null) {
+    html += '<div class="hint" style="margin-top:6px;padding-left:4px">'
+      + (asnP.cum_scanned != null ? '累计已测 <b>' + Number(asnP.cum_scanned).toLocaleString() + '</b> 个 IP' : '')
+      + (asnP.cum_scanned != null && asnP.cum_found != null ? '　·　' : '')
+      + (asnP.cum_found != null ? '累计找到 <b>' + Number(asnP.cum_found).toLocaleString() + '</b> 个反代' : '')
+      + '</div>';
   }
-  html += '</div>';
 
-  // ---- 第三块：跳过的阶段 ----
   if (skipped.length) {
-    html += '<div style="opacity:.5">'
-      + '<div style="font-weight:600;margin-bottom:8px;color:#cfd6e6">上游不跑的阶段</div>'
-      + skipped.map(p => '<div class="row" style="margin:0 0 6px">'
+    html += '<div style="opacity:.45;margin-top:16px">'
+      + '<div class="k" style="margin-bottom:6px">上游不跑的阶段</div>'
+      + skipped.map(p => '<div class="row" style="margin:0 0 5px">'
           + '<span class="k" style="margin:0">' + esc(p.name || '') + '</span>'
           + '<span class="pill idle">已跳过</span></div>').join('')
       + '</div>';

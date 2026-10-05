@@ -262,6 +262,7 @@ def apply_config(cfg):
     global NOTIFY_CHANNEL, NOTIFY_TARGET, NOTIFY_TIMEOUT, NOTIFY_ONLY_WITH_RESULT, PORTS
     global THREADS, LOOP
     global OUTPUT_REGIONS, OUTPUT_SPLIT, CHUNK_SIZE, FULL_SCAN, SUB_BATCH
+    global PREFIX_MIN_BATCH
     global SYS_GUARD_ENABLED, SYS_MIN_FREE_MB, PER_CONN_KB
     global POOL_ENABLED, POOL_FILE, POOL_MAX_AGE_DAYS, POOL_MIN_KEEP_RATIO
     global UPSTREAM_STAGE1_ONLY, POOL_MODE
@@ -311,6 +312,8 @@ def apply_config(cfg):
     if "PORTS" in cfg:                PORTS = str(get("PORTS") or "").strip()
     if "CHUNK_SIZE" in cfg:          CHUNK_SIZE = as_int(get("CHUNK_SIZE"), CHUNK_SIZE)
     if "SUB_BATCH" in cfg:            SUB_BATCH = max(1000, as_int(get("SUB_BATCH"), SUB_BATCH))
+    if "PREFIX_MIN_BATCH" in cfg:
+        PREFIX_MIN_BATCH = max(254, as_int(get("PREFIX_MIN_BATCH"), PREFIX_MIN_BATCH))
     if "SYS_GUARD_ENABLED" in cfg:
         SYS_GUARD_ENABLED = as_bool(get("SYS_GUARD_ENABLED"), SYS_GUARD_ENABLED)
     if "SYS_MIN_FREE_MB" in cfg:
@@ -936,6 +939,9 @@ CHUNK_SIZE = 20000
 # 逐 ASN 流水线里每个子批的大小。峰值内存 ≈ 这个数 x 250 字节
 # （5 万 -> 约 12MB）。调小更省内存，调大吞吐略高。
 SUB_BATCH = 50000
+# 逐网段处理时，小网段合并到至少这么多候选再一起测。
+# 一个 /24 只有 254 个 IP，用 800 并发去跑它并发根本用不满。
+PREFIX_MIN_BATCH = 4000
 
 # ==================== 全量扫描 ====================
 # 每个 /24 是 254 个独立主机（unicast），不是 anycast。
@@ -2151,6 +2157,178 @@ def read_final_summary(limit=200):
     return out
 
 
+# ==================== 逐网段生成器 ====================
+# 用户要的是「层层展开」的进度：厂商 -> ASN -> 网段 -> IP。
+# 原来的 iter_asn_batches 是按 SUB_BATCH 切块的，切点跟网段边界无关，
+# 所以报不出「当前在查哪个网段」。
+#
+# 这个生成器按【网段】切：每个网段单独一批 yield，
+# 调用方就能报出「第几个网段 / 共几个」「这个网段下测了多少 IP」。
+# 一个网段通常含 1~256 个 /24（实测 AS45102 平均 108 个），
+# 全量展开是 250~65000 个 IP，作为一批大小合适。
+
+
+def count_24s(nets):
+    """数一段网段里有多少个 /24。O(网段数)，不展开。
+
+    /20 算 16 个，/25 及更小的算 1 个（它们本身就在同一个 /24 里）。
+    """
+    total = 0
+    for n in nets:
+        pl = n.prefixlen
+        total += (1 << (24 - pl)) if pl <= 24 else 1
+    return total
+
+def sample_24s(nets, k, weights=None, total=None):
+    """从网段列表里随机取 k 个 /24 的首地址（int）。不展开成 /24 对象。
+
+    按每个网段含多少个 /24 加权，所以大网段被选中的概率天然更高，
+    和「先展开成 /24 列表再随机抽」是同一个分布。
+
+    **无放回**：同一个 /24 不会返回两次。有放回的话会浪费扫描名额
+    （重复的地址会在后面的去重里被丢掉，等于少扫了几个）。
+    """
+    if not nets or k <= 0:
+        return []
+    if weights is None:
+        weights = [(1 << (24 - n.prefixlen)) if n.prefixlen <= 24 else 1 for n in nets]
+    if total is None:
+        total = sum(weights)
+    if total <= 0:
+        return []
+
+    # 累积权重 + 二分查找：每个样本 O(log n) 而不是 O(n)
+    import bisect
+    cum = []
+    acc = 0
+    for w in weights:
+        acc += w
+        cum.append(acc)
+
+    k = min(k, total)          # 不可能取到比总数还多
+    out, seen = [], set()
+    # 取满 k 个就停；重复太多次（k 接近 total 时）就退出，避免空转
+    guard = 0
+    limit = max(k * 30, 1000)
+    while len(out) < k and guard < limit:
+        guard += 1
+        r = random.randrange(total)
+        i = bisect.bisect_right(cum, r)
+        if i >= len(nets):
+            i = len(nets) - 1
+        # 在这个网段里选第 (r - 前面累计) 个 /24
+        base_off = (cum[i - 1] if i > 0 else 0)
+        idx = r - base_off
+        base = int(nets[i].network_address) + idx * 256
+        if base in seen:
+            continue
+        seen.add(base)
+        out.append(base)
+    return out
+
+def provider_of(asn):
+    """ASN 号 -> 厂商名。用于面板显示「当前是哪个厂商」。"""
+    a = str(asn).upper().strip()
+    if not a.startswith("AS"):
+        a = "AS" + a
+    for name, members in ASN_GROUPS.items():
+        if a in members:
+            return name
+    return ""
+
+
+def iter_prefix_batches(asns, sample, timeout, retries, debug=False):
+    """逐个网段产出 (provider, asn, prefix_str, n24, [候选 dict])。
+
+    sample=0 表示全量（每个 /24 的 254 个地址）。
+    网段列表缓存到临时文件，不常驻内存。
+    """
+    import ipaddress
+    import tempfile
+
+    counts = {}
+    cache = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".nets",
+                                        delete=False, prefix="cfip-nets-")
+    cache_path = cache.name
+    try:
+        # ---- 第一遍：查每个 ASN 的网段，只留数量 + 写临时文件 ----
+        for idx, asn in enumerate(asns, 1):
+            prov = provider_of(asn)
+            set_progress("asn", "厂商 ASN（总进度）", idx, len(asns), current=asn,
+                         extra={"cur_asn": asn, "provider": prov})
+            try:
+                nets = asn_prefixes(asn, timeout, retries, debug)
+            except Exception as e:               # noqa: BLE001
+                log(f"    [ASN {asn}] 查询失败：{e}")
+                counts[asn] = 0
+                continue
+            n24 = count_24s(nets)
+            counts[asn] = n24
+            cache.write(asn + "\t" + ",".join(str(n) for n in nets) + "\n")
+            log(f"    [ASN {asn}] 网段 {len(nets)} 个 -> /24 {n24:,} 个")
+            del nets
+        cache.close()
+
+        grand = sum(counts.values())
+        if grand <= 0:
+            return
+        log(f"[*] 共 {grand:,} 个 /24"
+            + ("（全量模式，不采样）" if not sample else f"（目标采样 {sample} 个）"))
+
+        # ---- 第二遍：逐个 ASN -> 逐个网段 yield ----
+        with open(cache_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                asn, _, netstr = line.rstrip("\n").partition("\t")
+                n24_total = counts.get(asn, 0)
+                if n24_total <= 0 or not netstr:
+                    yield provider_of(asn), asn, "", 0, 0, 0, []
+                    continue
+                prov = provider_of(asn)
+                nets = [ipaddress.ip_network(x) for x in netstr.split(",") if x]
+
+                # 采样模式下，算出这个 ASN 要抽多少个 /24
+                if sample and sample > 0:
+                    k_asn = min(max(1, round(sample * n24_total / grand)), n24_total)
+                else:
+                    k_asn = 0
+
+                total_prefixes = len(nets)
+                for pi, n in enumerate(nets, 1):   # pi = 第几个网段
+                    addrs = []
+                    if sample and sample > 0:
+                        # 按这个网段占 ASN 的比例分配名额
+                        w = (1 << (24 - n.prefixlen)) if n.prefixlen <= 24 else 1
+                        k = max(1, round(k_asn * w / n24_total)) if n24_total else 1
+                        addrs = sample_24s([n], min(k, w))
+                    else:
+                        if n.prefixlen <= 24:
+                            step = 1 << (24 - n.prefixlen)
+                            base = int(n.network_address)
+                            addrs = [base + i * 256 for i in range(step)]
+                        else:
+                            addrs = [int(n.network_address)]
+
+                    cands = []
+                    for base in addrs:
+                        if FULL_SCAN:
+                            for host in range(1, 255):
+                                cands.append({"ip": str(ipaddress.IPv4Address(base + host)),
+                                              "port": "443", "protocol": "https",
+                                              "country": ""})
+                        else:
+                            cands.append({"ip": str(ipaddress.IPv4Address(base + random.randint(1, 254))),
+                                          "port": "443", "protocol": "https", "country": ""})
+                    n24_this = (1 << (24 - n.prefixlen)) if n.prefixlen <= 24 else 1
+                    yield prov, asn, str(n), n24_this, pi, total_prefixes, cands
+                    del cands, addrs
+                del nets
+    finally:
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
+
+
 # ==================== 逐 ASN 端到端流水线 ====================
 # 原来的做法：先把【所有】候选写进 ip.csv，再交给 ip.py 去测。
 # vps 档位全量 = 181,871 个 /24 x 254 = 4620 万个候选，
@@ -2332,7 +2510,17 @@ def clear_scan_state():
 
 
 def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
-    """逐 ASN 完成「生成 -> 预筛 -> 可用性检查」，结果追加到 STAGE1_CSV。
+    """逐网段完成「生成 -> 预筛 -> 可用性检查」，结果追加到 STAGE1_CSV。
+
+    进度分四级报给面板，层层展开：
+        provider  厂商（总进度）
+          asn     这个厂商下第几个 ASN
+            prefix  这个 ASN 下第几个网段
+              ip    这个网段内的 IP 测了多少
+
+    小网段会合并到至少 PREFIX_MIN_BATCH 个候选再一起测 ——
+    一个 /24 只有 254 个 IP，用 800 并发去跑它并发根本用不满，
+    而且每个网段单独起一次事件循环也有开销。网段级进度照常逐个上报。
 
     返回 (本轮找到的反代数, 是否完整跑完)。
     """
@@ -2347,30 +2535,25 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
     exclude_nets = _parse_cidrs(FOFA_EXCLUDE_CIDRS)
     skip_ips = _load_skip_ips(FOFA_SKIP_FILE)
 
-    # 本轮结果先写到 .new，全部跑完才原子替换 ——
-    # 中途崩了不会把上一轮的结果覆盖掉（池子那边也会判 complete）。
     tmp_path = stage1_path + ".new"
-    seen_keys = set()
-    asn_done = 0
-    cum_scanned = 0        # 累计已测 IP 数（过了 stage0 的）
     total_asns = len(asns)
     started = time.time()
+    seen_keys = set()
+    asn_done = 0
+    cum_scanned = 0
+    found = 0
+    pending, pending_prefixes = [], []
 
-    # 上游模式只跑 stage0/stage1。把不跑的阶段标成「已跳过」，
-    # 否则面板上它们会永远停在「未开始」，看不出是没轮到还是压根不会跑。
+    # 上游模式只跑 stage0/stage1，把不跑的阶段标成「已跳过」
     if UPSTREAM_STAGE1_ONLY:
         for _k, _n in (("s2", "stage2 · 延迟与测速（上游跳过，交给下游）"),
                        ("s3", "stage3 · 线路分析（上游跳过，交给下游）")):
             set_progress(_k, _n, 0, 0, extra={"skipped": True})
-    if len(as_list(PORTS)) <= 1 and (GEO_MAX and ASN_SAMPLE and ASN_SAMPLE > GEO_MAX):
-        set_progress("geo", "抓取 · 地区标注（地址太多，跳过）", 0, 0,
-                     extra={"skipped": True})
 
-    log(f"\n[*] 逐 ASN 流水线：{total_asns} 个 ASN，"
+    log(f"\n[*] 逐网段流水线：{total_asns} 个 ASN，"
         f"{'全量（每个 /24 的 254 个地址）' if FULL_SCAN else f'采样 {sample} 个 /24'}")
-    log(f"    结果写入 {tmp_path}（跑完才替换正式文件）")
 
-    # ---- 断点续跑：看有没有上一轮的进度 ----
+    # ---- 断点续跑 ----
     fp = scan_fingerprint(asns, sample)
     state = load_scan_state()
     done_asns = set()
@@ -2387,18 +2570,8 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
             pass
         clear_scan_state()
 
-    asns_todo = [a for a in asns if a not in done_asns]
-    if not asns_todo:
-        log("[*] 所有 ASN 都已扫完，直接进入收尾")
-    else:
-        log(f"[*] 本轮要扫 {len(asns_todo)} 个 ASN（跳过已完成的 {len(done_asns)} 个）")
-
-    # 续跑用追加模式；新开一轮用写模式（并写表头）
     resuming = bool(done_asns) and os.path.exists(tmp_path)
-    mode = "a" if resuming else "w"
-    found = 0
     if resuming:
-        # 数一下已有的结果条数
         try:
             with open(tmp_path, "r", encoding="utf-8-sig") as f:
                 found = max(0, sum(1 for _ in f) - 1)
@@ -2406,69 +2579,108 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
         except OSError:
             found = 0
 
-    with open(tmp_path, mode, encoding="utf-8-sig", newline="") as fh:
+    def flush_state():
+        save_scan_state({"fingerprint": fp, "done": sorted(done_asns),
+                         "started": state.get("started") or
+                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                         "found": found})
+
+    def process_batch(batch, label, asn, prov, prefix):
+        """测一批候选，返回通过列表。"""
+        nonlocal cum_scanned
+        if not batch:
+            return []
+        set_progress("ip", label + " · 网段内 IP 进度", 0, len(batch),
+                     extra={"asn": asn, "prefix": prefix, "waiting": True})
+        kept = []
+        for i in range(0, len(batch), 20000):
+            rows, _st = normalize(batch[i:i + 20000], set(asn_ports), exclude_nets,
+                                  skip_ips, [], 0)
+            kept.extend(rows)
+        if not kept:
+            set_progress("ip", label + " · 网段内 IP 进度", 0, 0,
+                         extra={"asn": asn, "prefix": prefix,
+                                "note": "本批没有可用候选"})
+            return []
+        total_kept = len(kept)
+
+        alive = kept
+        if ipt.STAGE0_ENABLED:
+            conc, why = safe_concurrency(ipt.STAGE0_CONCURRENCY)
+            if conc < ipt.STAGE0_CONCURRENCY:
+                log(f"[!] stage0 并发从 {ipt.STAGE0_CONCURRENCY} 压到 {conc}（{why}）")
+            alive = ipt.stage0_tcp_filter(kept, ipt.STAGE0_TIMEOUT, conc)
+            del kept
+            if not alive:
+                set_progress("ip", label + " · 网段内 IP 进度", total_kept, total_kept,
+                             extra={"asn": asn, "prefix": prefix,
+                                    "note": "本批没有端口开放的"})
+                return []
+            cum_scanned += len(alive)
+
+        conc1, why1 = safe_concurrency(ipt.ASYNCIO_CONCURRENCY)
+        if conc1 < ipt.ASYNCIO_CONCURRENCY:
+            log(f"[!] stage1 并发从 {ipt.ASYNCIO_CONCURRENCY} 压到 {conc1}（{why1}）")
+        passed = ipt.stage1_async(alive, conc1, ipt.CURL_TIMEOUT_SEC)
+        del alive
+        set_progress("ip", label + " · 网段内 IP 进度", total_kept, total_kept,
+                     extra={"asn": asn, "prefix": prefix, "found": len(passed)})
+        return passed
+
+    with open(tmp_path, "a" if resuming else "w",
+              encoding="utf-8-sig", newline="") as fh:
         wr = csv.writer(fh)
         if not resuming:
             wr.writerow(["ip", "port", "protocol", "cfcountry", "colo"])
 
         last_asn = None
-        for asn, cands in iter_asn_batches(asns, sample, FOFA_TIMEOUT, FOFA_RETRIES,
-                                           DEBUG, sub_batch=SUB_BATCH):
-            # 同一个 ASN 可能分多批过来，只在换 ASN 时计一次数
+        for (prov, asn, prefix, n24_this, pidx, ptotal,
+             cands) in iter_prefix_batches(asns, sample, FOFA_TIMEOUT,
+                                           FOFA_RETRIES, DEBUG):
+            # ---- 换 ASN：落一次断点，更新上面两级的进度 ----
             if asn != last_asn:
-                asn_done += 1
+                if last_asn is not None:
+                    done_asns.add(last_asn)
+                    flush_state()
                 last_asn = asn
-                set_progress("asn", "抓取 · 查询 ASN 宣告网段", asn_done, total_asns, current=asn)
+                asn_done += 1
+                sys_guard(f"ASN {asn}")
+                set_progress("provider", "厂商（总进度）", asn_done, total_asns,
+                             current=prov or "未归类",
+                             extra={"provider": prov, "asn": asn})
+                set_progress("asn", "厂商 ASN（总进度）", asn_done, total_asns,
+                             current=asn, extra={"cur_asn": asn, "provider": prov,
+                                                 "cum_scanned": cum_scanned,
+                                                 "cum_found": found})
+                if asn_done % 5 == 0 or asn_done == total_asns:
+                    el = time.time() - started
+                    log(f"[*] 进度 {asn_done}/{total_asns} 个 ASN，"
+                        f"已找到 {found} 个反代，耗时 {el/60:.1f} 分钟")
+
             if not cands:
                 continue
 
-            # 流水线是【逐 ASN 嵌套】的：每个 ASN 都要走一遍
-            # 查网段 -> 生成候选 -> stage0 -> stage1。
-            # 所以 stage0/stage1 的进度是【每个 ASN 重置一次】的，
-            # 面板要按「当前 ASN 的子步骤」展示，不能当成全局顺序的 6 步。
-            clear_progress("s0", "s1")
-            set_progress("s0", asn + " · stage0 预筛（TCP 连通性）", 0, 0,
-                         extra={"waiting": True, "asn": asn})
-            set_progress("s1", asn + " · stage1 可用性检查", 0, 0,
-                         extra={"waiting": True, "asn": asn})
+            # ---- 网段级进度：逐个上报 ----
+            set_progress("prefix", asn + " · 网段（子网）进度", pidx, ptotal,
+                         current=prefix or "—",
+                         extra={"asn": asn, "provider": prov, "prefix": prefix,
+                                "n24": n24_this})
 
-            # 归一化 / 排除私网 / 端口过滤（分批，避免一次性建大列表）
-            kept = []
-            for i in range(0, len(cands), 20000):
-                rows, _st = normalize(cands[i:i + 20000], set(asn_ports), exclude_nets,
-                                      skip_ips, [], 0)
-                kept.extend(rows)
+            # ---- 小网段合并 ----
+            pending.extend(cands)
+            pending_prefixes.append(prefix or asn)
             del cands
-            if not kept:
+            if len(pending) < PREFIX_MIN_BATCH and pidx < ptotal:
                 continue
 
-            # 每处理一个 ASN 前检查系统资源 —— 撑不住就先让路
-            sys_guard(f"ASN {asn}")
+            label = ("、".join(pending_prefixes[:2])
+                     + ("…" if len(pending_prefixes) > 2 else ""))
+            batch, pending = pending, []
+            pending_prefixes = []
+            passed = process_batch(batch, label, asn, prov, prefix)
+            del batch
 
-            # stage0：TCP 预筛（把黑洞筛掉）
-            alive = kept
-            if ipt.STAGE0_ENABLED:
-                conc, why = safe_concurrency(ipt.STAGE0_CONCURRENCY)
-                if conc < ipt.STAGE0_CONCURRENCY:
-                    log(f"[!] stage0 并发从 {ipt.STAGE0_CONCURRENCY} 压到 {conc}（{why}）")
-                alive = ipt.stage0_tcp_filter(kept, ipt.STAGE0_TIMEOUT, conc)
-                del kept
-                if not alive:
-                    continue
-                cum_scanned += len(alive)
-
-            # stage1：可用性（确认是不是真反代）
-            conc1, why1 = safe_concurrency(ipt.ASYNCIO_CONCURRENCY)
-            if conc1 < ipt.ASYNCIO_CONCURRENCY:
-                log(f"[!] stage1 并发从 {ipt.ASYNCIO_CONCURRENCY} 压到 {conc1}（{why1}）")
-            passed = ipt.stage1_async(alive, conc1, ipt.CURL_TIMEOUT_SEC)
-            del alive
-            set_progress("asn", "厂商 ASN（总进度）", asn_done, total_asns,
-                         current=asn, extra={"cum_scanned": cum_scanned,
-                                             "cum_found": found + len(passed),
-                                             "cur_asn": asn})
-
-            # 只把通过的写盘
             for r in passed:
                 key = "%s:%s" % (r["ip"], r.get("port", "443"))
                 if key in seen_keys:
@@ -2480,99 +2692,27 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
             fh.flush()
             del passed
 
-            # 每扫完一个 ASN 就落一次状态 —— 最多丢一个 ASN 的进度
-            done_asns.add(asn)
-            save_scan_state({"fingerprint": fp, "done": sorted(done_asns),
-                             "started": state.get("started") or
-                             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                             "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                             "found": found})
+        # 循环结束：冲掉最后一批 + 落最后一个 ASN 的断点
+        if pending:
+            passed = process_batch(pending, "最后一批", last_asn or "", "", "")
+            for r in passed:
+                key = "%s:%s" % (r["ip"], r.get("port", "443"))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                wr.writerow([r["ip"], r.get("port", "443"), "https",
+                             r.get("cfcountry", ""), r.get("colo", "")])
+                found += 1
+            fh.flush()
+        if last_asn is not None:
+            done_asns.add(last_asn)
+            flush_state()
 
-            if asn_done % 5 == 0 or asn_done == total_asns:
-                el = time.time() - started
-                log(f"[*] 进度 {asn_done}/{total_asns} 个 ASN，"
-                    f"已找到 {found} 个反代，耗时 {el/60:.1f} 分钟")
-
-    # 全部跑完 -> 原子替换正式结果
     os.replace(tmp_path, stage1_path)
     clear_scan_state()
-    log(f"[*] 逐 ASN 流水线完成：{total_asns} 个 ASN，"
+    log(f"[*] 逐网段流水线完成：{total_asns} 个 ASN，"
         f"找到 {found} 个反代 -> {stage1_path}")
     return found, True
-
-
-# ==================== 流式抓取（省内存）====================
-# 原来的做法：把 69 个 ASN 的所有 /24 全部展开成一个列表（18 万个
-# IPv4Network 对象，约 35MB），再采样、再建 18 万个 dict（约 42MB），
-# normalize 之后又复制一份（约 34MB）—— 峰值 110MB+，实测 fetch_ips.py
-# 常驻 176MB。1 核 726MB 的机器上这个量级很不健康。
-#
-# 流式做法：
-#   1. 数 /24 个数用 O(网段数) 而不是 O(/24 数) —— 一个 /20 直接算成 16 个，
-#      不展开。阿里云 1145 个网段 -> 12 万 /24，数一遍只要 1145 次循环。
-#   2. 逐个 ASN 处理：查网段 -> 按比例采样 -> 立刻过滤 -> 直接写 CSV，
-#      处理完就释放。峰值内存只跟【单个 ASN 的网段数】有关（最大约 1145 个）。
-#   3. 全程不持有完整候选列表。
-
-
-def count_24s(nets):
-    """数一段网段里有多少个 /24。O(网段数)，不展开。
-
-    /20 算 16 个，/25 及更小的算 1 个（它们本身就在同一个 /24 里）。
-    """
-    total = 0
-    for n in nets:
-        pl = n.prefixlen
-        total += (1 << (24 - pl)) if pl <= 24 else 1
-    return total
-
-
-def sample_24s(nets, k, weights=None, total=None):
-    """从网段列表里随机取 k 个 /24 的首地址（int）。不展开成 /24 对象。
-
-    按每个网段含多少个 /24 加权，所以大网段被选中的概率天然更高，
-    和「先展开成 /24 列表再随机抽」是同一个分布。
-
-    **无放回**：同一个 /24 不会返回两次。有放回的话会浪费扫描名额
-    （重复的地址会在后面的去重里被丢掉，等于少扫了几个）。
-    """
-    if not nets or k <= 0:
-        return []
-    if weights is None:
-        weights = [(1 << (24 - n.prefixlen)) if n.prefixlen <= 24 else 1 for n in nets]
-    if total is None:
-        total = sum(weights)
-    if total <= 0:
-        return []
-
-    # 累积权重 + 二分查找：每个样本 O(log n) 而不是 O(n)
-    import bisect
-    cum = []
-    acc = 0
-    for w in weights:
-        acc += w
-        cum.append(acc)
-
-    k = min(k, total)          # 不可能取到比总数还多
-    out, seen = [], set()
-    # 取满 k 个就停；重复太多次（k 接近 total 时）就退出，避免空转
-    guard = 0
-    limit = max(k * 30, 1000)
-    while len(out) < k and guard < limit:
-        guard += 1
-        r = random.randrange(total)
-        i = bisect.bisect_right(cum, r)
-        if i >= len(nets):
-            i = len(nets) - 1
-        # 在这个网段里选第 (r - 前面累计) 个 /24
-        base_off = (cum[i - 1] if i > 0 else 0)
-        idx = r - base_off
-        base = int(nets[i].network_address) + idx * 256
-        if base in seen:
-            continue
-        seen.add(base)
-        out.append(base)
-    return out
 
 
 def iter_asn_batches(asns, sample, timeout, retries, debug=False, sub_batch=50000):
