@@ -758,7 +758,14 @@ def test_incremental_pool():
     check("每批结束后调回调", "on_found(fresh)" in f)
     check("run_once 传了增量回调", "on_found=_on_found" in f)
     check("增量写用并集（不删旧的）", "update_pool(rows, complete=False)" in f)
-    check("增量写有节流", "_inc['t']" in f or "_inc" in f)
+    check("增量写有节流", "_inc" in f)
+    # 关键：续跑时要把【断点里已有的结果】先补进池子。
+    # 池子原来只在整轮跑完时更新，而一轮 24 小时 ——
+    # 中途重启的话那些反代永远进不了池子，下游拉 /api/ips 拿到空的。
+    # 实测踩过：断点显示 539 个，池子却是 0 个。
+    check("续跑时补写池子", "已把断点里的" in f)
+    check("read_stage1_results 支持指定路径",
+          "def read_stage1_results(path=None)" in f)
     # 批次大小要小一点，结果才来得快
     import re
     m = re.search(r"^PREFIX_MIN_BATCH = (\d+)", f, re.M)
