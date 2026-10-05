@@ -693,6 +693,51 @@ def test_four_level_progress():
     check("回调有节流（不然每 IP 写一次盘）", "last_tick0" in f and "last_tick1" in f)
 
 
+
+
+# ---------------------------------------------------------------- 21. 冒烟测试
+def test_pipeline_smoke():
+    """真跑一遍完整流水线。
+
+    为什么需要：静态检查抓不到运行时错误。
+    实测踩过 len(alive0)（alive0 已经是 int）—— 语法没问题、
+    所有字符串检查都过，但服务每轮跑到第一个批次结束就崩，
+    systemd 重启后从断点续跑又崩在同一处，永远卡在第 3 个 ASN。
+    用户看到的现象是「一直在重新开始」。
+
+    这个测试用最小的 ASN 真跑一遍，跑不完就算失败。
+    """
+    import subprocess
+    import shutil
+
+    out = os.path.join(ROOT, "output")
+    backup = None
+    if os.path.isdir(out):
+        backup = out + ".smoke_bak"
+        shutil.rmtree(backup, ignore_errors=True)
+        shutil.move(out, backup)
+    try:
+        r = subprocess.run(
+            [sys.executable, "fetch_ips.py", "-source", "asn", "-asns", "zgocloud",
+             "-asn-sample", "0", "-once", "-run"],
+            cwd=ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=300)
+        blob = (r.stdout or "") + (r.stderr or "")
+        ok = r.returncode == 0
+        # 明确的失败信号
+        bad = "Traceback" in blob or "TypeError" in blob or "NameError" in blob
+        check("完整流水线能跑完（不崩）", ok and not bad,
+              f"rc={r.returncode} " + (blob[-300:] if bad else ""))
+        check("流水线跑到了收尾", "流水线完成" in blob or "逐网段流水线" in blob,
+              blob[-200:])
+    except subprocess.TimeoutExpired:
+        check("完整流水线能跑完（不崩）", False, "超时 300 秒")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+        if backup:
+            shutil.move(backup, out)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  回归测试")
@@ -704,7 +749,7 @@ if __name__ == "__main__":
                test_no_bulk_candidate_file, test_pool_safety,
                test_port_protocols, test_resume, test_skipped_stages,
                test_resource_guard, test_critical_functions_exist,
-               test_four_level_progress):
+               test_four_level_progress, test_pipeline_smoke):
         print(f"\n[{fn.__name__}] {fn.__doc__.splitlines()[0] if fn.__doc__ else ''}")
         try:
             fn()

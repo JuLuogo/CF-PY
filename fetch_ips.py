@@ -2671,8 +2671,9 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
         passed = ipt.stage1_async(alive, conc1, ipt.CURL_TIMEOUT_SEC,
                                   on_progress=tick1)
         del alive
+        # alive0 已经是 int（stage0 通过数），不要再 len()
         set_progress("ip1", label + " · 可用性检查（是否真反代）",
-                     len(alive0), len(alive0),
+                     alive0, alive0,
                      extra={"asn": asn, "prefix": prefix, "found": len(passed)})
         return passed
 
