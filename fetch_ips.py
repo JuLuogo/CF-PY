@@ -2046,13 +2046,14 @@ def write_status(**kw):
         pass
 
 
-def read_stage1_results():
+def read_stage1_results(path=None):
     """读上游 stage1 的结果文件（ip.py -stage1 写的）。
 
     格式：ip, port, protocol, cfcountry, colo
     这些就是「所有确认是真反代的 IP」—— 上游池子的内容。
     """
-    path = STAGE1_CSV if os.path.isabs(STAGE1_CSV) else os.path.join(HERE, STAGE1_CSV)
+    if path is None:
+        path = STAGE1_CSV if os.path.isabs(STAGE1_CSV) else os.path.join(HERE, STAGE1_CSV)
     out = []
     if not os.path.exists(path):
         return out
@@ -2701,6 +2702,19 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1, on_found=None):
                             "note": f"检查了 {alive0:,} 个，"
                                     f"真反代 {len(passed):,} 个"})
         return passed
+
+    # 关键：续跑时先把【已经找到的结果】并进池子。
+    # 池子原来只在整轮跑完时才更新，而一轮 24 小时 ——
+    # 中途重启的话，这些反代永远进不了池子，下游拉 /api/ips 拿到空的。
+    # 实测踩过：断点显示已找到 539 个，但池子个数是 0。
+    if resuming and POOL_ENABLED and on_found is not None:
+        try:
+            existing = read_stage1_results(tmp_path)
+            if existing:
+                on_found(existing)
+                log(f"[*] 已把断点里的 {len(existing)} 个反代补进池子")
+        except Exception as e:                   # noqa: BLE001
+            log(f"[!] 补写池子失败（不影响扫描）：{e}")
 
     with open(tmp_path, "a" if resuming else "w",
               encoding="utf-8-sig", newline="") as fh:
