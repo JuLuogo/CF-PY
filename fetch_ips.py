@@ -2600,19 +2600,25 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
         nonlocal cum_scanned
         if not batch:
             return []
-        set_progress("ip0", label + " · TCP 连通性预筛", 0, len(batch),
-                     extra={"asn": asn, "prefix": prefix, "waiting": True})
-        set_progress("ip1", label + " · 可用性检查（是否真反代）", 0, 0,
-                     extra={"asn": asn, "prefix": prefix, "waiting": True})
+        # 这两条不是「IP 数到第几个」，而是「这一批 IP 走完了没有 + 结果」：
+        #   ip0  把这一批候选全 TCP 连一遍，看有多少端口是开的
+        #   ip1  对端口开着的那部分做 TLS+trace，看有多少是真反代
+        # 所以名字里带上动作，note 里带上结果数字。
+        set_progress("ip0", "① TCP 端口检查（" + label + "）", 0, len(batch),
+                     extra={"asn": asn, "prefix": prefix,
+                            "note": f"本批 {len(batch):,} 个候选 IP"})
+        set_progress("ip1", "② 可用性检查（是否真反代）", 0, 0,
+                     extra={"asn": asn, "prefix": prefix,
+                            "note": "等 ① 筛出端口开着的再开始"})
         kept = []
         for i in range(0, len(batch), 20000):
             rows, _st = normalize(batch[i:i + 20000], set(asn_ports), exclude_nets,
                                   skip_ips, [], 0)
             kept.extend(rows)
         if not kept:
-            set_progress("ip0", label + " · TCP 连通性预筛", 0, 0,
+            set_progress("ip0", "① TCP 端口检查（" + label + "）", 0, 0,
                          extra={"asn": asn, "prefix": prefix,
-                                "note": "本批没有可用候选"})
+                                "note": "本批候选都被过滤规则排除了"})
             return []
         total_kept = len(kept)
 
@@ -2632,7 +2638,7 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
             if done < total and now - last_tick0[0] < 2.0:
                 return
             last_tick0[0] = now
-            set_progress("ip0", _lbl + " · TCP 连通性预筛", done, total,
+            set_progress("ip0", "① TCP 端口检查（" + _lbl + "）", done, total,
                          ip=ip, extra={"asn": asn, "prefix": prefix})
 
         def tick1(done, total, ip, ok, _lbl=label):
@@ -2640,7 +2646,7 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
             if done < total and now - last_tick1[0] < 2.0:
                 return
             last_tick1[0] = now
-            set_progress("ip1", _lbl + " · 可用性检查（是否真反代）", done, total,
+            set_progress("ip1", "② 可用性检查（是否真反代）", done, total,
                          ip=ip, extra={"asn": asn, "prefix": prefix,
                                        "passed": bool(ok)})
 
@@ -2654,17 +2660,26 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
                                           on_progress=tick0)
             del kept
             if not alive:
-                set_progress("ip0", label + " · TCP 连通性预筛",
+                set_progress("ip0", "① TCP 端口检查（" + label + "）",
                              total_kept, total_kept,
                              extra={"asn": asn, "prefix": prefix,
-                                    "note": "本批没有端口开放的"})
-                set_progress("ip1", label + " · 可用性检查（是否真反代）",
-                             0, 0, extra={"asn": asn, "prefix": prefix,
-                                          "note": "stage0 已全部筛掉，无需检查"})
+                                    "note": f"本批 {total_kept:,} 个候选，"
+                                            f"端口开着的 0 个 —— 全部淘汰"})
+                set_progress("ip1", "② 可用性检查（是否真反代）", 0, 0,
+                             extra={"asn": asn, "prefix": prefix,
+                                    "note": "① 已经全部筛掉，无需检查"})
                 return []
+            set_progress("ip0", "① TCP 端口检查（" + label + "）",
+                         total_kept, total_kept,
+                         extra={"asn": asn, "prefix": prefix,
+                                "note": f"本批 {total_kept:,} 个候选，"
+                                        f"端口开着的 {len(alive):,} 个"})
             cum_scanned += len(alive)
             alive0 = len(alive)
 
+        set_progress("ip1", "② 可用性检查（是否真反代）", 0, alive0,
+                     extra={"asn": asn, "prefix": prefix,
+                            "note": f"对 ① 筛出的 {alive0:,} 个做 TLS+trace"})
         conc1, why1 = safe_concurrency(ipt.ASYNCIO_CONCURRENCY)
         if conc1 < ipt.ASYNCIO_CONCURRENCY:
             log(f"[!] stage1 并发从 {ipt.ASYNCIO_CONCURRENCY} 压到 {conc1}（{why1}）")
@@ -2672,9 +2687,10 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
                                   on_progress=tick1)
         del alive
         # alive0 已经是 int（stage0 通过数），不要再 len()
-        set_progress("ip1", label + " · 可用性检查（是否真反代）",
-                     alive0, alive0,
-                     extra={"asn": asn, "prefix": prefix, "found": len(passed)})
+        set_progress("ip1", "② 可用性检查（是否真反代）", alive0, alive0,
+                     extra={"asn": asn, "prefix": prefix, "found": len(passed),
+                            "note": f"检查了 {alive0:,} 个，"
+                                    f"真反代 {len(passed):,} 个"})
         return passed
 
     with open(tmp_path, "a" if resuming else "w",

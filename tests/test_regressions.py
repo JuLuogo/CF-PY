@@ -440,6 +440,12 @@ def test_progress_keys():
     # 共用一个进度条的话，用户会看到「飞快跑到 100% 又重置」，
     # 误以为没在测 IP（用户实测反馈过）。
     check("TCP 预筛和可用性分开报", 'set_progress("ip0"' in f and 'set_progress("ip1"' in f)
+    # 名字里要带动作和序号，note 里要带结果数字 ——
+    # 用户反馈「这个网段内的IP到底是什么意思，我这根本就不明白」。
+    # 光有 done/total 不够，得说清「这一步在干什么、筛出多少」。
+    check("两级带序号和动作", '"① TCP 端口检查' in f and '"② 可用性检查' in f)
+    check("带结果数字", "端口开着的" in f and "真反代" in f)
+    check("ip1 不是 0/0", 'set_progress("ip1", "② 可用性检查（是否真反代）", 0, alive0,' in f)
     check("两个回调各自节流", "last_tick0" in f and "last_tick1" in f)
 
     # 流水线是逐 ASN 嵌套的，面板必须分两级显示 ——
