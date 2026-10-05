@@ -249,6 +249,11 @@ def test_webui():
     check("路径不区分大小写", 'rstrip("/").lower()' in wsrc)
     check("鉴权失败有引导", "怎么传" in wsrc)
     check("没有引用不存在的 PORT", "{PORT}" not in wsrc)
+    # /api/ips 默认必须返回【全部】。原来默认 limit=200，
+    # 用户实测「API 并没有输出全部的IP，只输出了大概两百个」。
+    check("limit 默认为 0（全部）", chr(39)+chr(39) in wsrc or 'or ["0"]' in wsrc)
+    check("limit 只在非 0 时截断", "if limit and len(out) >= limit" in wsrc)
+    check("JSON 带 truncated 标记", "truncated" in wsrc)
     # 上游模式只跑 stage1，country（IP 归属地，stage2 的 geo 查询填的）
     # 永远是空的 —— 必须用 cfcountry（CF 边缘节点所在国）兜底，
     # 否则地区统计全是「??」、地区 API 永远返回空。

@@ -247,7 +247,7 @@ def serve_ips(qs):
       csv    CSV
       hosts  /etc/hosts 风格（配合 dnsmasq / AdGuard 用）
     过滤（可选）：
-      limit=200            最多返回多少个
+      limit=0              最多返回多少个，0 = 全部（默认）
       max_latency=100      延迟上限 ms
       max_loss=5           丢包率上限 %
       min_speed=1          速度下限 MB/s
@@ -257,7 +257,9 @@ def serve_ips(qs):
       region  只含 OUTPUT_REGIONS 白名单里的地区 —— /api/ips?set=region
     """
     fmt = (qs.get("format") or ["text"])[0].lower()
-    limit = int((qs.get("limit") or ["200"])[0])
+    # limit=0 表示不限制 —— 默认返回【全部】。
+    # 原来默认 200，用户实测「API 并没有输出全部的IP，只输出了大概两百个」。
+    limit = int((qs.get("limit") or ["0"])[0])
     max_lat = _num((qs.get("max_latency") or [""])[0])
     max_loss = _num((qs.get("max_loss") or [""])[0])
     min_speed = _num((qs.get("min_speed") or [""])[0])
@@ -294,9 +296,11 @@ def serve_ips(qs):
             ip = ln.split("#")[0].split()[0].strip()
             if ip:
                 ips.append(ip)
-        ips = ips[:limit]
+        if limit:
+            ips = ips[:limit]
         if fmt == "json":
-            return {"count": len(ips), "source": "ip.txt", "ips": ips}
+            return {"count": len(ips), "source": "ip.txt", "limit": limit,
+                    "truncated": bool(limit and len(ips) >= limit), "ips": ips}
         return "\n".join(ips) + ("\n" if ips else "")
 
     out = []
@@ -319,11 +323,13 @@ def serve_ips(qs):
                     "score": _num(r.get("score")), "country": cc,
                     "city": r.get("city", ""), "route": r.get("route", ""),
                     "cfcountry": r.get("cfcountry", "")})
-        if len(out) >= limit:
+        if limit and len(out) >= limit:
             break
 
     if fmt == "json":
         return {"count": len(out), "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "limit": limit,
+                "truncated": bool(limit and len(out) >= limit),
                 "filters": {"max_latency": max_lat, "max_loss": max_loss,
                             "min_speed": min_speed, "country": sorted(want_cc)},
                 "ips": out}
