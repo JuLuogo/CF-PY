@@ -788,7 +788,11 @@ function renderProgress(st){
   // 主层级：厂商 -> ASN -> 网段 -> IP（ASN 数据源走这条）
   // 兜底：s0/s1 是 ip.py 子进程路径（fofa 数据源）上报的，
   // 有就一并渲染，没有就跳过。
-  const LV = ['provider', 'asn', 'prefix', 'ip', 's0', 's1'];
+  // 主层级：厂商 -> ASN -> 网段 -> TCP预筛 -> 可用性检查
+  //   ip0 = stage0 纯 TCP 连通性（快，不验证是不是 CF）
+  //   ip1 = stage1 可用性检查（TLS + trace，慢）
+  // 兜底：s0/s1 是 ip.py 子进程路径（fofa 数据源）上报的。
+  const LV = ['provider', 'asn', 'prefix', 'ip0', 'ip1', 'ip', 's0', 's1'];
   const have = LV.filter(k => prog[k]);
   const skipped = ['geo', 's2', 's3'].map(k => prog[k]).filter(p => p && p.skipped);
 

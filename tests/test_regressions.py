@@ -435,7 +435,12 @@ def test_progress_keys():
     missing = sorted(reported - four)
     check("后端上报的进度 key 都在面板能渲染的范围内", not missing,
           f"后端上报但前端不渲染: {missing}")
-    check("前端按四级渲染", "'provider', 'asn', 'prefix', 'ip'" in w)
+    check("前端按五级渲染", "'provider', 'asn', 'prefix', 'ip0', 'ip1'" in w)
+    # IP 级必须拆成两条：TCP 预筛（快，不验证 CF）和可用性检查（慢）。
+    # 共用一个进度条的话，用户会看到「飞快跑到 100% 又重置」，
+    # 误以为没在测 IP（用户实测反馈过）。
+    check("TCP 预筛和可用性分开报", 'set_progress("ip0"' in f and 'set_progress("ip1"' in f)
+    check("两个回调各自节流", "last_tick0" in f and "last_tick1" in f)
 
     # 流水线是逐 ASN 嵌套的，面板必须分两级显示 ——
     # 否则用户只能看到第一条在动，后面全「未开始」，不知道具体在哪一步。
@@ -675,7 +680,7 @@ def test_four_level_progress():
     check("逐网段生成器", "def iter_prefix_batches" in f)
     check("小网段合并", "PREFIX_MIN_BATCH" in f)
 
-    check("前端按四级渲染", "'provider', 'asn', 'prefix', 'ip'" in w)
+    check("前端按五级渲染", "'provider', 'asn', 'prefix', 'ip0'" in w)
     check("前端有面包屑", "chain.push" in w)
     check("前端有缩进层级", "indent: i" in w)
     # 断点状态不能每个网段都写一次（1145 个网段 x 69 个 ASN = 7.9 万次写盘）

@@ -2600,7 +2600,9 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
         nonlocal cum_scanned
         if not batch:
             return []
-        set_progress("ip", label + " · 网段内 IP 进度", 0, len(batch),
+        set_progress("ip0", label + " · TCP 连通性预筛", 0, len(batch),
+                     extra={"asn": asn, "prefix": prefix, "waiting": True})
+        set_progress("ip1", label + " · 可用性检查（是否真反代）", 0, 0,
                      extra={"asn": asn, "prefix": prefix, "waiting": True})
         kept = []
         for i in range(0, len(batch), 20000):
@@ -2608,46 +2610,69 @@ def run_asn_pipeline(asns, sample, extra_run_args, round_no=1):
                                   skip_ips, [], 0)
             kept.extend(rows)
         if not kept:
-            set_progress("ip", label + " · 网段内 IP 进度", 0, 0,
+            set_progress("ip0", label + " · TCP 连通性预筛", 0, 0,
                          extra={"asn": asn, "prefix": prefix,
                                 "note": "本批没有可用候选"})
             return []
         total_kept = len(kept)
 
-        # IP 级进度的节流：每 2 秒或结束时才写一次 status.json，
+        # IP 级进度分两条，跟实际阶段一一对应 ——
+        #   ip0 = stage0 纯 TCP 连通性（不验证是不是 CF，所以快）
+        #   ip1 = stage1 可用性检查（TLS + /cdn-cgi/trace，慢得多）
+        # 原来两条共用一个进度条，看着「飞快跑到 100% 又重置」，
+        # 容易误以为没在测 IP。分开之后一眼能看出当前在哪一步。
+        #
+        # 节流：每 2 秒或结束时才写一次 status.json，
         # 否则每个 IP 都写一次盘，扫描本身就被拖慢了
-        last_tick = [0.0]
+        last_tick0 = [0.0]
+        last_tick1 = [0.0]
 
-        def ip_tick(done, total, ip, ok, _lbl=label):
+        def tick0(done, total, ip, ok, _lbl=label):
             now = time.time()
-            if done < total and now - last_tick[0] < 2.0:
+            if done < total and now - last_tick0[0] < 2.0:
                 return
-            last_tick[0] = now
-            set_progress("ip", _lbl + " · 网段内 IP 进度", done, total,
+            last_tick0[0] = now
+            set_progress("ip0", _lbl + " · TCP 连通性预筛", done, total,
                          ip=ip, extra={"asn": asn, "prefix": prefix})
 
+        def tick1(done, total, ip, ok, _lbl=label):
+            now = time.time()
+            if done < total and now - last_tick1[0] < 2.0:
+                return
+            last_tick1[0] = now
+            set_progress("ip1", _lbl + " · 可用性检查（是否真反代）", done, total,
+                         ip=ip, extra={"asn": asn, "prefix": prefix,
+                                       "passed": bool(ok)})
+
         alive = kept
+        alive0 = total_kept        # stage0 关掉时 stage1 的分母就是全部候选
         if ipt.STAGE0_ENABLED:
             conc, why = safe_concurrency(ipt.STAGE0_CONCURRENCY)
             if conc < ipt.STAGE0_CONCURRENCY:
                 log(f"[!] stage0 并发从 {ipt.STAGE0_CONCURRENCY} 压到 {conc}（{why}）")
             alive = ipt.stage0_tcp_filter(kept, ipt.STAGE0_TIMEOUT, conc,
-                                          on_progress=ip_tick)
+                                          on_progress=tick0)
             del kept
             if not alive:
-                set_progress("ip", label + " · 网段内 IP 进度", total_kept, total_kept,
+                set_progress("ip0", label + " · TCP 连通性预筛",
+                             total_kept, total_kept,
                              extra={"asn": asn, "prefix": prefix,
                                     "note": "本批没有端口开放的"})
+                set_progress("ip1", label + " · 可用性检查（是否真反代）",
+                             0, 0, extra={"asn": asn, "prefix": prefix,
+                                          "note": "stage0 已全部筛掉，无需检查"})
                 return []
             cum_scanned += len(alive)
+            alive0 = len(alive)
 
         conc1, why1 = safe_concurrency(ipt.ASYNCIO_CONCURRENCY)
         if conc1 < ipt.ASYNCIO_CONCURRENCY:
             log(f"[!] stage1 并发从 {ipt.ASYNCIO_CONCURRENCY} 压到 {conc1}（{why1}）")
         passed = ipt.stage1_async(alive, conc1, ipt.CURL_TIMEOUT_SEC,
-                                  on_progress=ip_tick)
+                                  on_progress=tick1)
         del alive
-        set_progress("ip", label + " · 网段内 IP 进度", total_kept, total_kept,
+        set_progress("ip1", label + " · 可用性检查（是否真反代）",
+                     len(alive0), len(alive0),
                      extra={"asn": asn, "prefix": prefix, "found": len(passed)})
         return passed
 
